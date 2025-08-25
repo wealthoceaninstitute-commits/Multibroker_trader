@@ -1,37 +1,77 @@
-# --- Environment & secrets ---
+# ---------------- Environment & secrets ----------------
 .env
 .env.*
 !.env.example
+*.env
 
-# --- Logs ---
+# ---------------- Logs ----------------
 logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
-# --- Python build/cache ---
+# ---------------- Node / Next.js ----------------
+node_modules/
+.pnp/
+.pnpm-debug.log*
+.npm/
+.eslintcache
+.stylelintcache
+.cache/
+.turbo/
+.vite/
+coverage/
+coverage.xml
+lcov.info
+
+# Next.js outputs
+.next/
+.next.cache/
+out/
+.vercel/
+.vercel_build_output/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# ---------------- Python build/cache ----------------
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.so
 *.egg-info/
 .eggs/
 dist/
 build/
 pip-wheel-metadata/
 
-# --- Virtual envs ---
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+.python-version
+
+# ---------------- Virtual envs ----------------
 .venv/
 venv/
 ENV/
 env/
 
-# --- Editors/OS ---
+# ---------------- Editors/OS ----------------
 .vscode/
 .idea/
 *.iml
 .DS_Store
 Thumbs.db
 
-# --- App data (keep masters only) ---
+# ---------------- App data (keep masters only) ----------------
 data/**
 !data/.gitkeep
 !data/masters/
@@ -39,6 +79,21 @@ data/**
 !data/masters/security_id.csv
 !data/masters/security_id_min_qty.csv
 
-# --- Extra safety for token dumps ---
+# ---------------- Local databases (comment these out if you WANT to commit a seed DB) ----------------
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# ---------------- Temp files ----------------
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# ---------------- Extra safety for token dumps ----------------
 **/tokens*.json
 **/auth*.json
+service-account*.json
