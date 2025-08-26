@@ -1,12 +1,9 @@
-// api.js
+// components/api.js
 import axios from 'axios';
-
-const env = (process.env.NEXT_PUBLIC_API_BASE || '').replace(/\/$/, '');
-const baseURL = env || 'http://127.0.0.1:5001';   // hard fallback to FastAPI
-console.log('[API] baseURL =', baseURL);
+import API_BASE from '../src/lib/apiBase';  // path is correct for your repo layout
 
 const api = axios.create({
-  baseURL,
+  baseURL: API_BASE,            // no localhost fallback in prod
   headers: { 'Content-Type': 'application/json' },
   withCredentials: false,
 });
