@@ -1,11 +1,9 @@
 // components/api.js
 import axios from 'axios';
-import API_BASE from '../src/lib/apiBase';  // path is correct for your repo layout
+import API_BASE from '../src/lib/apiBase.js';
 
 const api = axios.create({
-  baseURL: API_BASE,            // no localhost fallback in prod
+  baseURL: API_BASE,
   headers: { 'Content-Type': 'application/json' },
-  withCredentials: false,
 });
-
 export default api;
