@@ -264,90 +264,104 @@ def get_positions() -> Dict[str, List[Dict[str, Any]]]:
 
     return data
 
-def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
-    """
-    Close (square-off) positions for given [{name, symbol}] by placing
-    opposite MARKET orders via MOFSLOPENAPI using live position info.
-    """
-    # map: name -> client json
-    by_name = {}
+# Motilal — Close Position (aligned with get_orders pattern)
+@app.post("/close_position")
+async def close_position(payload: dict = Body(...)):
+    data = payload or {}
+    positions = data.get("positions", []) or []
+
+    messages: list[str] = []
+    threads: list[threading.Thread] = []
+    thread_lock = threading.Lock()
+
+    # --- build a name -> client json index (MO only) ---
+    name_index: dict[str, dict] = {}
     for c in _read_clients():
-        nm = (c.get("name") or c.get("display_name") or "").strip()
+        nm = c.get("name") or c.get("display_name") or c.get("userid") or c.get("client_id")
         if nm:
-            by_name[nm] = c
+            name_index[str(nm)] = c
 
-    out: List[str] = []
-    for req in positions or []:
-        name   = (req or {}).get("name") or ""
-        symbol = (req or {}).get("symbol") or ""
-        cj     = by_name.get(name)
-        if not cj:
-            out.append(f"❌ Client not found for: {name}")
-            continue
+    # --- Load min-qty map once (unchanged) ---
+    conn = sqlite3.connect(SQLITE_DB)
+    cursor = conn.cursor()
+    min_qty_map: dict[str, int] = {}
+    try:
+        cursor.execute("SELECT [Security ID], [Min Qty] FROM symbols")
+        for sid, qty in cursor.fetchall():
+            if sid:
+                min_qty_map[str(sid)] = int(qty) if qty else 1
+    except Exception as e:
+        print(f"❌ Error reading min_qty from DB: {e}")
+    conn.close()
 
-        uid = (cj.get("userid") or cj.get("client_id") or "").strip()
+    def close_single_position(pos: dict):
+        name = pos.get("name")
+        symbol = pos.get("symbol")
+        quantity = float(pos.get("quantity", 0) or 0.0)
+        transaction_type = (pos.get("transaction_type") or ("SELL" if quantity > 0 else "BUY")).upper()
+
+        # meta captured when positions were fetched
+        meta = position_meta.get((name, symbol))
+        cj = name_index.get(str(name))  # client json by name
+        if not meta or not cj:
+            with thread_lock:
+                messages.append(f"❌ Missing data for {name} - {symbol}")
+            return
+
+        # ensure session and userid like get_orders()
         sdk = _ensure_session(cj)
-        if not sdk or not uid:
-            out.append(f"❌ No session for: {name}")
-            continue
+        userid = str(cj.get("userid") or cj.get("client_id") or "").strip()
+        if not sdk or not userid:
+            with thread_lock:
+                messages.append(f"❌ No session/userid for {name}")
+            return
 
-        # fetch fresh positions
-        try:
-            resp = sdk.GetPosition()
-            rows = resp.get("data", []) if (resp and resp.get("status") == "SUCCESS") else []
-        except Exception as e:
-            out.append(f"❌ GetPosition failed for {name}: {e}")
-            continue
+        symboltoken = meta.get("symboltoken")
+        min_qty = min_qty_map.get(str(symboltoken), 1)
+        # keep your lots calc style (no new logic introduced)
+        lots = max(1, int(quantity // min_qty)) if min_qty > 0 else int(quantity)
 
-        pos = None
-        for r in rows:
-            if (r.get("symbol") or "") == symbol:
-                pos = r
-                break
-        if not pos:
-            out.append(f"❌ Position not found: {name} - {symbol}")
-            continue
-
-        buy_q  = int(pos.get("buyquantity", 0) or 0)
-        sell_q = int(pos.get("sellquantity", 0) or 0)
-        net_q  = buy_q - sell_q
-        if net_q == 0:
-            out.append(f"ℹ️ Already flat: {name} - {symbol}")
-            continue
-
-        side = "SELL" if net_q > 0 else "BUY"
-        qty  = abs(net_q)
-
-        # Build a minimal MARKET order
         order = {
-            "clientcode": uid,
-            "exchange": pos.get("exchange", "NSE"),
-            "symboltoken": pos.get("symboltoken"),
-            "buyorsell": side,
+            "clientcode": userid,                     # <-- aligned with get_orders
+            "exchange": meta["exchange"],
+            "symboltoken": symboltoken,
+            "buyorsell": transaction_type,
             "ordertype": "MARKET",
-            "producttype": pos.get("producttype", "CNC"),
+            "producttype": meta["producttype"],
             "orderduration": "DAY",
             "price": 0,
             "triggerprice": 0,
-            # NOTE: API expects lots for derivatives; this uses qty as-is.
-            # Adjust to lot-size if needed in your environment.
-            "quantityinlot": qty,
+            "quantityinlot": lots,
             "disclosedquantity": 0,
             "amoorder": "N",
             "algoid": "",
             "goodtilldate": "",
-            "tag": "SQUAREOFF"
+            "tag": "",
         }
 
         try:
-            r = sdk.PlaceOrder(order)
-            ok_msg = (r or {}).get("message","")
-            ok = isinstance(ok_msg, str) and ("order placed" in ok_msg.lower() or "success" in ok_msg.lower())
-            out.append(f"{'✅' if ok else '❌'} {name} - close {symbol}: {ok_msg or r}")
+            resp = sdk.PlaceOrder(order)
+            if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
+                with thread_lock:
+                    messages.append(f"✅ Closed: {name} - {symbol}")
+            else:
+                with thread_lock:
+                    messages.append(
+                        f"❌ Failed: {name} - {symbol} - {resp.get('message', 'Unknown') if isinstance(resp, dict) else resp}"
+                    )
         except Exception as e:
-            out.append(f"❌ {name} - close {symbol}: {e}")
+            with thread_lock:
+                messages.append(f"❌ Error for {name} - {symbol}: {e}")
 
-    return out
+    for pos in positions:
+        t = threading.Thread(target=close_single_position, args=(pos,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    return {"message": messages}
+
 def _get_available_margin(sdk, clientcode: str) -> float:
     """
     Motilal: fetch 'Total Available Margin for Cash' via GetReportMarginSummary.
@@ -571,6 +585,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
