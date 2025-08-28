@@ -204,53 +204,72 @@ def cancel_orders(orders: List[Dict[str, Any]]) -> List[str]:
 
 
 
-def get_positions() -> Dict[str, List[Dict[str, Any]]]:
-    """Return Motilal positions normalized into {open:[...], closed:[...]}"""
-    data: Dict[str, List[Dict[str, Any]]] = {"open": [], "closed": []}
+def get_positions():
+    """
+    Motilal — positions shaped like CT_FastAPI:
+      - buy_avg  = buyamount / buyquantity (if > 0)
+      - sell_avg = sellamount / sellquantity (if > 0)
+      - net_profit:
+          * qty > 0  -> (LTP - buy_avg) * qty
+          * qty < 0  -> (sell_avg - buy_avg) * abs(qty)   # same as CT_FastAPI
+          * qty == 0 -> booked_profit
+    Returns: {"open": [...], "closed": [...]}
+    """
+    out = {"open": [], "closed": []}
 
-    for c in _read_clients():
-        uid  = (c.get("userid") or c.get("client_id") or "").strip()
-        name = c.get("name") or c.get("display_name") or uid
-        sdk  = _ensure_session(c)
-        if not sdk:
-            logging.error("[MO] No session for %s (%s)", name, uid)
+    for cfg in _load_client_configs():
+        session = _get_session(cfg)
+        if not session:
             continue
 
         try:
-            resp = sdk.GetPosition()
-            rows = resp.get("data", []) if (resp and resp.get("status") == "SUCCESS") else []
+            positions = session.get_positions() or []
         except Exception as e:
-            logging.error("[MO] get_positions error for %s: %s", name, e)
-            rows = []
+            print(f"[motilal:get_positions] {cfg.get('name')}: {e}")
+            continue
 
-        for pos in rows:
-            buy_qty  = (pos.get("buyquantity", 0)  or 0)
-            sell_qty = (pos.get("sellquantity", 0) or 0)
-            qty      = buy_qty - sell_qty
-            booked   = (pos.get("bookedprofitloss", 0) or 0)
-            buy_amt  = (pos.get("buyamount", 0) or 0)
-            sell_amt = (pos.get("sellamount", 0) or 0)
-            ltp      = (pos.get("LTP", 0) or 0)
+        if not isinstance(positions, list):
+            positions = []
 
-            buy_avg  = (buy_amt / buy_qty)  if buy_qty  > 0 else 0
-            sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0
-            # MTM + booked P&L
-            net_pnl  = ((ltp - buy_avg) * qty if qty > 0 else (sell_avg - ltp) * abs(qty)) + booked
+        for p in positions:
+            # Quantities & amounts
+            buy_qty  = float(p.get("buyquantity") or 0)
+            sell_qty = float(p.get("sellquantity") or 0)
+            qty      = int(buy_qty - sell_qty)
+
+            buy_amt  = float(p.get("buyamount") or 0)
+            sell_amt = float(p.get("sellamount") or 0)
+            booked   = float(p.get("bookedprofitloss") or 0)
+
+            # Averages
+            buy_avg  = (buy_amt / buy_qty) if buy_qty > 0 else 0.0
+            sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0.0
+
+            # LTP (note: MOFSL LTP here should be in rupees; if your endpoint
+            # returns paise, divide by 100 before using)
+            ltp = float(p.get("LTP") or 0)
+
+            # Net P/L — same formula as CT_FastAPI
+            if qty > 0:
+                net = (ltp - buy_avg) * qty
+            elif qty < 0:
+                net = (sell_avg - buy_avg) * abs(qty)
+            else:
+                net = booked
 
             row = {
-                "name": name,
-                "symbol": pos.get("symbol", "") or "",
+                "name": cfg.get("name", ""),
+                "symbol": p.get("symbol") or p.get("scripname") or "",
                 "quantity": qty,
                 "buy_avg": round(buy_avg, 2),
                 "sell_avg": round(sell_avg, 2),
-                "net_profit": round(net_pnl, 2),
+                "net_profit": round(net, 2),
             }
-            if qty == 0:
-                data["closed"].append(row)
-            else:
-                data["open"].append(row)
 
-    return data
+            (out["open"] if qty != 0 else out["closed"]).append(row)
+
+    return out
+
 def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
     """
     Close (square-off) positions for given [{name, symbol}] by placing
@@ -558,5 +577,6 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
