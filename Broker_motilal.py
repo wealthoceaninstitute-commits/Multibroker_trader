@@ -204,69 +204,92 @@ def cancel_orders(orders: List[Dict[str, Any]]) -> List[str]:
 
 
 
-def get_positions():
-    """
-    Motilal — positions shaped like CT_FastAPI:
-      - buy_avg  = buyamount / buyquantity (if > 0)
-      - sell_avg = sellamount / sellquantity (if > 0)
-      - net_profit:
-          * qty > 0  -> (LTP - buy_avg) * qty
-          * qty < 0  -> (sell_avg - buy_avg) * abs(qty)   # same as CT_FastAPI
-          * qty == 0 -> booked_profit
-    Returns: {"open": [...], "closed": [...]}
-    """
-    out = {"open": [], "closed": []}
+from typing import Any, Dict, List
 
+def get_positions() -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Aggregate Motilal positions across all clients and return a dict with
+    'open' and 'closed' positions, matching CT_FastAPI's logic.
+
+    Each row contains: name, symbol, quantity, buy_avg, sell_avg, net_profit.
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {"open": [], "closed": []}
+
+    # Iterate over each client configuration in the Motilal directory
     for cfg in _load_client_configs():
-        session = _get_session(cfg)
+        uid = (cfg.get("client_id") or cfg.get("userid") or "").strip()
+        name = (cfg.get("name") or cfg.get("display_name") or uid).strip()
+        if not uid:
+            continue
+
+        # Retrieve existing session or log in if needed.  Do not enforce
+        # session.verified here, because positions can be fetched with an
+        # unverified token.
+        session = _get_session(uid)
+        if not session:
+            if not login(cfg):
+                continue
+            session = _get_session(uid)
         if not session:
             continue
 
-        try:
-            positions = session.get_positions() or []
-        except Exception as e:
-            print(f"[motilal:get_positions] {cfg.get('name')}: {e}")
+        # Always attempt to fetch positions; Motilal allows this even when
+        # the token is unverified.
+        raw_positions = session.get_positions() or []
+        if not isinstance(raw_positions, list):
             continue
 
-        if not isinstance(positions, list):
-            positions = []
+        for pos in raw_positions:
+            # Compute net quantity
+            buy_q = float(pos.get("buyquantity", 0) or 0)
+            sell_q = float(pos.get("sellquantity", 0) or 0)
+            quantity = int(buy_q - sell_q)
 
-        for p in positions:
-            # Quantities & amounts
-            buy_qty  = float(p.get("buyquantity") or 0)
-            sell_qty = float(p.get("sellquantity") or 0)
-            qty      = int(buy_qty - sell_qty)
+            # Compute total amounts and averages
+            buy_amt = float(pos.get("buyamount", 0) or 0)
+            sell_amt = float(pos.get("sellamount", 0) or 0)
+            buy_avg  = (buy_amt  / buy_q)  if buy_q  > 0 else 0.0
+            sell_avg = (sell_amt / sell_q) if sell_q > 0 else 0.0
 
-            buy_amt  = float(p.get("buyamount") or 0)
-            sell_amt = float(p.get("sellamount") or 0)
-            booked   = float(p.get("bookedprofitloss") or 0)
+            # Last traded price (LTP).  CT_FastAPI uses LTP as-is (usually rupees)
+            try:
+                ltp = float(pos.get("LTP", 0) or 0)
+            except Exception:
+                ltp = 0.0
 
-            # Averages
-            buy_avg  = (buy_amt / buy_qty) if buy_qty > 0 else 0.0
-            sell_avg = (sell_amt / sell_qty) if sell_qty > 0 else 0.0
+            # Booked profit for flat positions
+            booked_profit = float(pos.get("bookedprofitloss", 0) or 0)
 
-            # LTP (note: MOFSL LTP here should be in rupees; if your endpoint
-            # returns paise, divide by 100 before using)
-            ltp = float(p.get("LTP") or 0)
-
-            # Net P/L — same formula as CT_FastAPI
-            if qty > 0:
-                net = (ltp - buy_avg) * qty
-            elif qty < 0:
-                net = (sell_avg - buy_avg) * abs(qty)
+            # Net profit calculation exactly like CT_FastAPI:
+            #   long  -> (LTP - buy_avg) * quantity
+            #   short -> (sell_avg - buy_avg) * abs(quantity)
+            #   flat  -> booked_profit
+            if quantity > 0:
+                net_profit = (ltp - buy_avg) * quantity
+            elif quantity < 0:
+                net_profit = (sell_avg - buy_avg) * abs(quantity)
             else:
-                net = booked
+                net_profit = booked_profit
+
+            # Symbol may be under different keys (symbol/tradingsymbol/scripname)
+            symbol = (
+                pos.get("symbol")
+                or pos.get("tradingsymbol")
+                or pos.get("scripname")
+                or ""
+            )
 
             row = {
-                "name": cfg.get("name", ""),
-                "symbol": p.get("symbol") or p.get("scripname") or "",
-                "quantity": qty,
-                "buy_avg": round(buy_avg, 2),
-                "sell_avg": round(sell_avg, 2),
-                "net_profit": round(net, 2),
+                "name":       name,
+                "symbol":     symbol,
+                "quantity":   quantity,
+                "buy_avg":    round(buy_avg, 2),
+                "sell_avg":   round(sell_avg, 2),
+                "net_profit": round(net_profit, 2),
             }
 
-            (out["open"] if qty != 0 else out["closed"]).append(row)
+            # Append to 'open' if quantity != 0, otherwise to 'closed'
+            (out["open"] if quantity != 0 else out["closed"]).append(row)
 
     return out
 
@@ -577,6 +600,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
