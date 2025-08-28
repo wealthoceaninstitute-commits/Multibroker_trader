@@ -264,8 +264,7 @@ def get_positions() -> Dict[str, List[Dict[str, Any]]]:
 
     return data
 
-# Motilal — Close Position (aligned with get_orders pattern)
-@app.post("/close_position")
+
 async def close_position(payload: dict = Body(...)):
     data = payload or {}
     positions = data.get("positions", []) or []
@@ -585,6 +584,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
