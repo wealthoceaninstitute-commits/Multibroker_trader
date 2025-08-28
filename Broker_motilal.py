@@ -264,6 +264,121 @@ def get_positions() -> Dict[str, List[Dict[str, Any]]]:
 
     return data
 
+# add near the top with the other imports
+import sqlite3
+
+# optional: put this next to DATA_DIR/CLIENTS_DIR constants
+SQLITE_DB = os.path.abspath(
+    os.environ.get("SQLITE_DB", os.path.join(DATA_DIR, "symbols.sqlite3"))
+)
+
+def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
+    """
+    Close (square-off) positions for given [{name, symbol}] by placing
+    opposite MARKET orders via MOFSLOPENAPI. Lots are computed using a
+    min-qty map loaded once from the SQLite symbols DB (keyed by symboltoken).
+    """
+
+    # map client display name -> client json (we reuse your login/session flow)
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for c in _read_clients():
+        nm = (c.get("name") or c.get("display_name") or "").strip()
+        if nm:
+            by_name[nm] = c
+
+    # ---- load min-qty map once (Security ID -> Min Qty), use symboltoken as key ----
+    min_qty_map: Dict[str, int] = {}
+    try:
+        if os.path.exists(SQLITE_DB):
+            conn = sqlite3.connect(SQLITE_DB)
+            cur = conn.cursor()
+            # your route uses [Security ID] with Min Qty; we mirror that
+            cur.execute('SELECT [Security ID], [Min Qty] FROM symbols')
+            for sid, q in cur.fetchall():
+                if sid:
+                    try:
+                        min_qty_map[str(sid)] = int(q) if q else 1
+                    except Exception:
+                        min_qty_map[str(sid)] = 1
+            conn.close()
+    except Exception as e:
+        # non-fatal; we’ll default lots to raw qty
+        logging.error("close_positions: min-qty DB read error: %s", e)
+
+    out: List[str] = []
+
+    for req in positions or []:
+        name   = (req or {}).get("name") or ""
+        symbol = (req or {}).get("symbol") or ""
+        if not name or not symbol:
+            out.append(f"❌ Missing name/symbol in request: {req}")
+            continue
+
+        cj  = by_name.get(name)
+        uid = (cj.get("userid") or cj.get("client_id") or "").strip() if cj else ""
+        sdk = _ensure_session(cj) if cj else None
+        if not (cj and uid and sdk):
+            out.append(f"❌ No session for: {name}")
+            continue
+
+        # ---- fetch fresh positions to get exchange, producttype, symboltoken, and net qty
+        try:
+            resp = sdk.GetPosition()
+            rows = resp.get("data", []) if (resp and resp.get("status") == "SUCCESS") else []
+        except Exception as e:
+            out.append(f"❌ GetPosition failed for {name}: {e}")
+            continue
+
+        pos_row = next((r for r in rows if (r.get("symbol") or "") == symbol), None)
+        if not pos_row:
+            out.append(f"❌ Position not found: {name} - {symbol}")
+            continue
+
+        buy_q  = int(pos_row.get("buyquantity", 0) or 0)
+        sell_q = int(pos_row.get("sellquantity", 0) or 0)
+        net_q  = buy_q - sell_q
+        if net_q == 0:
+            out.append(f"ℹ️ Already flat: {name} - {symbol}")
+            continue
+
+        side = "SELL" if net_q > 0 else "BUY"
+        qty  = abs(net_q)
+
+        # ---- lot sizing: use symboltoken to pick min qty (defaults to 1)
+        token   = str(pos_row.get("symboltoken") or "")
+        min_qty = max(1, int(min_qty_map.get(token, 1)))
+        lots    = max(1, qty // min_qty) if min_qty > 0 else qty
+
+        # ---- build MO payload (same fields/shape as your working route)
+        order = {
+            "clientcode": uid,
+            "exchange": pos_row.get("exchange", "NSE"),
+            "symboltoken": pos_row.get("symboltoken"),
+            "buyorsell": side,
+            "ordertype": "MARKET",
+            "producttype": pos_row.get("producttype", "CNC"),
+            "orderduration": "DAY",
+            "price": 0,
+            "triggerprice": 0,
+            "quantityinlot": int(lots),      # lots derived from min-qty map
+            "disclosedquantity": 0,
+            "amoorder": "N",
+            "algoid": "",
+            "goodtilldate": "",
+            "tag": "SQUAREOFF",
+        }
+
+        try:
+            r = sdk.PlaceOrder(order)
+            msg = (r or {}).get("message", "")
+            ok  = isinstance(msg, str) and ("success" in msg.lower() or "order placed" in msg.lower())
+            out.append(f"{'✅' if ok else '❌'} {name} - close {symbol}: {msg or r}")
+        except Exception as e:
+            out.append(f"❌ {name} - close {symbol}: {e}")
+
+    return out
+
+
 
 
 
@@ -490,6 +605,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
