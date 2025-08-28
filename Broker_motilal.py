@@ -265,101 +265,7 @@ def get_positions() -> Dict[str, List[Dict[str, Any]]]:
     return data
 
 
-async def close_position(payload: dict = Body(...)):
-    data = payload or {}
-    positions = data.get("positions", []) or []
 
-    messages: list[str] = []
-    threads: list[threading.Thread] = []
-    thread_lock = threading.Lock()
-
-    # --- build a name -> client json index (MO only) ---
-    name_index: dict[str, dict] = {}
-    for c in _read_clients():
-        nm = c.get("name") or c.get("display_name") or c.get("userid") or c.get("client_id")
-        if nm:
-            name_index[str(nm)] = c
-
-    # --- Load min-qty map once (unchanged) ---
-    conn = sqlite3.connect(SQLITE_DB)
-    cursor = conn.cursor()
-    min_qty_map: dict[str, int] = {}
-    try:
-        cursor.execute("SELECT [Security ID], [Min Qty] FROM symbols")
-        for sid, qty in cursor.fetchall():
-            if sid:
-                min_qty_map[str(sid)] = int(qty) if qty else 1
-    except Exception as e:
-        print(f"❌ Error reading min_qty from DB: {e}")
-    conn.close()
-
-    def close_single_position(pos: dict):
-        name = pos.get("name")
-        symbol = pos.get("symbol")
-        quantity = float(pos.get("quantity", 0) or 0.0)
-        transaction_type = (pos.get("transaction_type") or ("SELL" if quantity > 0 else "BUY")).upper()
-
-        # meta captured when positions were fetched
-        meta = position_meta.get((name, symbol))
-        cj = name_index.get(str(name))  # client json by name
-        if not meta or not cj:
-            with thread_lock:
-                messages.append(f"❌ Missing data for {name} - {symbol}")
-            return
-
-        # ensure session and userid like get_orders()
-        sdk = _ensure_session(cj)
-        userid = str(cj.get("userid") or cj.get("client_id") or "").strip()
-        if not sdk or not userid:
-            with thread_lock:
-                messages.append(f"❌ No session/userid for {name}")
-            return
-
-        symboltoken = meta.get("symboltoken")
-        min_qty = min_qty_map.get(str(symboltoken), 1)
-        # keep your lots calc style (no new logic introduced)
-        lots = max(1, int(quantity // min_qty)) if min_qty > 0 else int(quantity)
-
-        order = {
-            "clientcode": userid,                     # <-- aligned with get_orders
-            "exchange": meta["exchange"],
-            "symboltoken": symboltoken,
-            "buyorsell": transaction_type,
-            "ordertype": "MARKET",
-            "producttype": meta["producttype"],
-            "orderduration": "DAY",
-            "price": 0,
-            "triggerprice": 0,
-            "quantityinlot": lots,
-            "disclosedquantity": 0,
-            "amoorder": "N",
-            "algoid": "",
-            "goodtilldate": "",
-            "tag": "",
-        }
-
-        try:
-            resp = sdk.PlaceOrder(order)
-            if isinstance(resp, dict) and resp.get("status") == "SUCCESS":
-                with thread_lock:
-                    messages.append(f"✅ Closed: {name} - {symbol}")
-            else:
-                with thread_lock:
-                    messages.append(
-                        f"❌ Failed: {name} - {symbol} - {resp.get('message', 'Unknown') if isinstance(resp, dict) else resp}"
-                    )
-        except Exception as e:
-            with thread_lock:
-                messages.append(f"❌ Error for {name} - {symbol}: {e}")
-
-    for pos in positions:
-        t = threading.Thread(target=close_single_position, args=(pos,))
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-
-    return {"message": messages}
 
 def _get_available_margin(sdk, clientcode: str) -> float:
     """
@@ -584,6 +490,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
