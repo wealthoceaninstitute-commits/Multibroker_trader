@@ -356,7 +356,7 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             "symboltoken": pos_row.get("symboltoken"),
             "buyorsell": side,
             "ordertype": "MARKET",
-            "producttype": pos_row.get("producttype", "DELIVERY"),
+            "producttype": pos_row.get("producttype"),
             "orderduration": "DAY",
             "price": 0,
             "triggerprice": 0,
@@ -605,6 +605,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
