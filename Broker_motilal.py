@@ -264,63 +264,37 @@ def get_positions() -> Dict[str, List[Dict[str, Any]]]:
 
     return data
 
-from typing import List, Dict, Any
-import os, json, sqlite3, logging
-
 def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
     """
     Close (square-off) positions for given [{name, symbol}] by placing
-    opposite MARKET orders via MOFSLOPENAPI using live position info.
-
-    Debug prints:
-      - meta (net qty, min qty, lots, producttype, etc.)
-      - exact MO payload being sent
-      - raw broker response
+    opposite MARKET orders via MOFSLOPENAPI. Also prints the exact payload
+    and raw response so you can see them in Railway Logs.
     """
+    import json, os, sqlite3, sys, logging
 
-    # ---- map client display name -> client json (reuse your login/session flow)
+    # --- map client display name -> client json (reuse the login/session flow)
     by_name: Dict[str, Dict[str, Any]] = {}
     for c in _read_clients():
         nm = (c.get("name") or c.get("display_name") or "").strip()
         if nm:
             by_name[nm] = c
 
-    # ---- load min-qty map once (try Security ID and Symbol Token) ----
-    min_qty_by_secid:  Dict[str, int] = {}
-    min_qty_by_token:  Dict[str, int] = {}
-
+    # --- load min-qty map once (Security ID -> Min Qty). We key by symboltoken.
+    min_qty_map: Dict[str, int] = {}
     try:
         if os.path.exists(SQLITE_DB):
             conn = sqlite3.connect(SQLITE_DB)
             cur  = conn.cursor()
-
-            # Your route uses [Security ID] -> [Min Qty]; keep that first
-            try:
-                cur.execute('SELECT [Security ID], [Min Qty] FROM symbols')
-                for sid, q in cur.fetchall():
-                    if sid:
-                        try:
-                            min_qty_by_secid[str(sid)] = int(q) if q else 1
-                        except Exception:
-                            min_qty_by_secid[str(sid)] = 1
-            except Exception:
-                pass
-
-            # Also try [Symbol Token] -> [Min Qty] if the column exists (helps Motilal)
-            try:
-                cur.execute('SELECT [Symbol Token], [Min Qty] FROM symbols')
-                for tok, q in cur.fetchall():
-                    if tok:
-                        try:
-                            min_qty_by_token[str(tok)] = int(q) if q else 1
-                        except Exception:
-                            min_qty_by_token[str(tok)] = 1
-            except Exception:
-                pass
-
+            cur.execute('SELECT [Security ID], [Min Qty] FROM symbols')
+            for sid, q in cur.fetchall():
+                if sid:
+                    try:
+                        min_qty_map[str(sid)] = int(q) if q else 1
+                    except Exception:
+                        min_qty_map[str(sid)] = 1
             conn.close()
     except Exception as e:
-        logging.error("close_positions: min-qty DB read error: %s", e)
+        print(f"[MO][CLOSE] min-qty DB read error: {e}", flush=True)
 
     out: List[str] = []
 
@@ -338,10 +312,10 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             out.append(f"❌ No session for: {name}")
             continue
 
-        # ---- fetch fresh positions (to get exchange, producttype, symboltoken, and net qty)
+        # --- fetch fresh positions so we get exchange, product, symboltoken, and net qty
         try:
             resp = sdk.GetPosition()
-            rows = resp.get("data", []) if (resp and str(resp.get("status")).upper() == "SUCCESS") else []
+            rows = resp.get("data", []) if (resp and resp.get("status") == "SUCCESS") else []
         except Exception as e:
             out.append(f"❌ GetPosition failed for {name}: {e}")
             continue
@@ -351,7 +325,7 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             out.append(f"❌ Position not found: {name} - {symbol}")
             continue
 
-        buy_q  = int(pos_row.get("buyquantity", 0)  or 0)
+        buy_q  = int(pos_row.get("buyquantity", 0) or 0)
         sell_q = int(pos_row.get("sellquantity", 0) or 0)
         net_q  = buy_q - sell_q
         if net_q == 0:
@@ -361,28 +335,21 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
         side = "SELL" if net_q > 0 else "BUY"
         qty  = abs(net_q)
 
-        # ---- lot sizing
-        token = str(pos_row.get("symboltoken") or "")
-        secid = str(pos_row.get("securityid") or pos_row.get("security_id") or "")
-        min_qty = (
-            min_qty_by_token.get(token) or
-            min_qty_by_secid.get(secid) or
-            1
-        )
-        lots = max(1, int(qty // min_qty)) if min_qty > 0 else int(qty)
+        # --- lot sizing: use symboltoken to pick min qty (defaults to 1)
+        token   = str(pos_row.get("symboltoken") or "")
+        min_qty = max(1, int(min_qty_map.get(token, 1)))
+        lots    = max(1, int(qty // min_qty)) if min_qty > 0 else int(qty)
 
-        # ---- build MO payload (same shape as your working route)
-        product = (
-            pos_row.get("producttype")
-            or pos_row.get("productname")
-            or "CNC"
-        )
+        # producttype from position; MO usually expects NORMAL/VALUEPLUS/etc.
+        product = (pos_row.get("productname") or pos_row.get("producttype") or "CNC")
+
+        # --- build MO payload
         order = {
             "clientcode": uid,
-            "exchange":    pos_row.get("exchange", "NSE"),
+            "exchange": pos_row.get("exchange", "NSE"),
             "symboltoken": token,
-            "buyorsell":   side,
-            "ordertype":   "MARKET",
+            "buyorsell": side,
+            "ordertype": "MARKET",
             "producttype": product,
             "orderduration": "DAY",
             "price": 0,
@@ -395,53 +362,36 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             "tag": "SQUAREOFF",
         }
 
-        # ---- DEBUG prints: meta, payload, response
+        # --- print the payload (and flush so it appears in logs immediately)
         try:
-            meta_dbg = {
-                "name": name,
-                "uid": uid,
-                "symbol": symbol,
-                "exchange": order["exchange"],
-                "producttype": product,
-                "net_q": net_q,
-                "abs_qty": qty,
-                "min_qty": min_qty,
-                "lots": lots,
-                "symboltoken": token,
-                "securityid": secid,
-            }
-            print("[MO][CLOSE] meta =>")
-            print(json.dumps(meta_dbg, indent=2))
-            print("[MO][CLOSE] payload =>")
-            print(json.dumps(order, indent=2))
-        except Exception as _e:
-            print("[MO][CLOSE] debug print failed:", _e)
+            print(f"[MO][CLOSE] payload for {name} - {symbol} =>", flush=True)
+            print(json.dumps(order, indent=2), flush=True)
+        except Exception:
+            # never let logging break the flow
+            pass
 
-        # ---- place order
+        # --- call the API
         try:
             r = sdk.PlaceOrder(order)
-            try:
-                print("[MO][CLOSE] response =>")
-                print(json.dumps(r, indent=2))
-            except Exception:
-                print("[MO][CLOSE] raw response =>", r)
-
-            ok = False
-            if isinstance(r, dict):
-                if str(r.get("status", "")).upper() == "SUCCESS":
-                    ok = True
-                msg = str(r.get("message", ""))
-                if "order placed" in msg.lower():
-                    ok = True
-            msg = (r or {}).get("message", "") if isinstance(r, dict) else str(r)
-            out.append(f"{'✅' if ok else '❌'} {name} - close {symbol}: {msg}")
         except Exception as e:
-            out.append(f"❌ {name} - close {symbol}: {e}")
+            r = {"status": "ERROR", "message": str(e)}
+
+        # --- print the raw response too
+        try:
+            print(f"[MO][CLOSE] response for {name} - {symbol} =>", flush=True)
+            print(json.dumps(r, indent=2), flush=True)
+        except Exception:
+            pass
+
+        # --- normalize message for UI
+        msg = r.get("message") if isinstance(r, dict) else None
+        ok = False
+        if isinstance(r, dict):
+            st = (r.get("status") or "").upper()
+            ok = st == "SUCCESS" or ("order placed" in (msg or "").lower())
+        out.append(f"{'✅' if ok else '❌'} {name} - close {symbol}: {msg or r}")
 
     return out
-
-
-
 
 
 def _get_available_margin(sdk, clientcode: str) -> float:
@@ -667,6 +617,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
 
