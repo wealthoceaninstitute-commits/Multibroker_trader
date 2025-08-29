@@ -206,8 +206,8 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             messages.append(f"❌ Client not found for: {name}")
             continue
 
-        token   = (cj.get("apikey") or cj.get("access_token") or "").strip()
-        client  = (cj.get("userid") or cj.get("client_id") or "").strip()
+        token  = (cj.get("apikey") or cj.get("access_token") or "").strip()
+        client = (cj.get("userid") or cj.get("client_id") or "").strip()
         if not token or not client:
             messages.append(f"❌ Missing token/client for: {name}")
             continue
@@ -227,53 +227,8 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
                         if (x.get("tradingSymbol") or "") == symbol:
                             prow.append(x)
             if not prow:
-                messages.append(f"❌ Position not found: {name} - {symbol}")
-                continue
-            pos = prow[0]
-        except Exception as e:
-            messages.append(f"❌ Fetch positions failed for {name}: {e}")
-            continue
+                messages.append(f"❌ Position not fou
 
-        net_qty = int(pos.get("netQty", 0) or 0)
-        if net_qty == 0:
-            messages.append(f"ℹ️ Already flat: {name} - {symbol}")
-            continue
-
-        side  = "SELL" if net_qty > 0 else "BUY"
-        qty   = abs(net_qty)
-
-        payload = {
-            "dhanClientId": client,
-            "correlationId": f"SQ{int(__import__('time').time())}{client[-4:]}",
-            "transactionType": side,
-            "exchangeSegment": pos.get("exchangeSegment"),
-            "productType": pos.get("productType", "CNC"),
-            "orderType": "MARKET",
-            "validity": "DAY",
-            "securityId": str(pos.get("securityId")),
-            "quantity": int(qty),
-            "disclosedQuantity": 0,
-            "price": "",
-            "triggerPrice": "",
-            "afterMarketOrder": False,
-            "amoTime": "OPEN",
-            "boProfitValue": "",
-            "boStopLossValue": ""
-        }
-
-        try:
-            r = requests.post(
-                "https://api.dhan.co/v2/orders",
-                headers={"Content-Type": "application/json", "access-token": token},
-                json=payload, timeout=10
-            )
-            data = r.json() if r.content else {}
-            ok = str(data.get("status","")).lower() == "success"
-            messages.append(f"{'✅' if ok else '❌'} {name} - close {symbol}: {data or r.status_code}")
-        except Exception as e:
-            messages.append(f"❌ {name} - close {symbol}: {e}")
-
-    return messages
 
 def get_holdings() -> Dict[str, Any]:
     """
@@ -556,3 +511,4 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
