@@ -138,52 +138,6 @@ def cancel_order_dhan(client_json: Dict[str, Any], order_id: str) -> Dict[str, A
 
 
 
-def get_positions() -> Dict[str, List[Dict[str, Any]]]:
-    """Return Dhan positions normalized into {open:[...], closed:[...]}"""
-    positions_data: Dict[str, List[Dict[str, Any]]] = {"open": [], "closed": []}
-
-    for c in _read_clients():
-        token = (c.get("apikey") or c.get("access_token") or "").strip()
-        if not token:
-            continue
-        name = c.get("name") or c.get("display_name") or c.get("userid") or c.get("client_id") or ""
-        try:
-            resp = requests.get(
-                "https://api.dhan.co/v2/positions",
-                headers={"Content-Type": "application/json", "access-token": token},
-                timeout=10
-            )
-            rows = resp.json() if resp.status_code == 200 else []
-            if not isinstance(rows, list):
-                rows = []
-        except Exception as e:
-            print(f"[DHAN] get_positions error for {name}: {e}")
-            rows = []
-
-        for pos in rows:
-            net_qty   = pos.get("netQty", 0) or 0
-            buy_avg   = pos.get("buyAvg", 0) or 0
-            sell_avg  = pos.get("sellAvg", 0) or 0
-            symbol    = pos.get("tradingSymbol", "") or ""
-            realized  = pos.get("realizedProfit", 0) or 0
-            unreal    = pos.get("unrealizedProfit", 0) or 0
-            net_pnl   = (realized + unreal)
-
-            row = {
-                "name": name,
-                "symbol": symbol,
-                "quantity": net_qty,
-                "buy_avg": round(buy_avg, 2),
-                "sell_avg": round(sell_avg, 2),
-                "net_profit": round(net_pnl, 2),
-            }
-            if net_qty == 0:
-                positions_data["closed"].append(row)
-            else:
-                positions_data["open"].append(row)
-
-    return positions_data
-
 def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
     """
     Close (square-off) positions for given [{name, symbol}] by placing
@@ -227,8 +181,81 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
                         if (x.get("tradingSymbol") or "") == symbol:
                             prow.append(x)
             if not prow:
-                messages.append(f"❌ Position not fou
+                messages.append(f"❌ Position not found: {name} - {symbol}")
+                continue
+            pos = prow[0]
+        except Exception as e:
+            messages.append(f"❌ Fetch positions failed for {name}: {e}")
+            continue
 
+        net_qty = int(pos.get("netQty", 0) or 0)
+        if net_qty == 0:
+            messages.append(f"ℹ️ Already flat: {name} - {symbol}")
+            continue
+
+        side  = "SELL" if net_qty > 0 else "BUY"
+        qty   = abs(net_qty)
+
+        payload = {
+            "dhanClientId": client,
+            "correlationId": f"SQ{int(__import__('time').time())}{client[-4:]}",
+            "transactionType": side,
+            "exchangeSegment": pos.get("exchangeSegment"),
+            "productType": pos.get("productType", "CNC"),
+            "orderType": "MARKET",
+            "validity": "DAY",
+            "securityId": str(pos.get("securityId")),
+            "quantity": int(qty),
+            "disclosedQuantity": 0,
+            "price": "",
+            "triggerPrice": "",
+            "afterMarketOrder": False,
+            "amoTime": "OPEN",
+            "boProfitValue": "",
+            "boStopLossValue": ""
+        }
+
+        try:
+            r = requests.post(
+                "https://api.dhan.co/v2/orders",
+                headers={"Content-Type": "application/json", "access-token": token},
+                json=payload,
+                timeout=10
+            )
+            # be defensive: body can be {}, or error JSON, or normal order JSON
+            try:
+                data = r.json() if r.content else {}
+            except Exception:
+                data = {}
+
+            # --- normalize success ---
+            order_id     = str(data.get("orderId") or "").strip()
+            order_status = str(data.get("orderStatus") or data.get("status") or "").strip().upper()
+            err_msg      = str(data.get("message") or data.get("errorMessage") or "").strip()
+
+            # Dhan typically returns 200 + {'orderId':..., 'orderStatus':'TRANSIT'} on success
+            ok_http = r.status_code in (200, 202)
+            ok_body = (
+                bool(order_id) or
+                order_status in {"SUCCESS", "TRANSIT", "PENDING", "SENT", "RECEIVED", "PLACED", "OPEN"}
+            )
+            ok = ok_http and ok_body
+
+            # craft a compact message like you saw in the UI
+            if ok:
+                shown = {"orderId": order_id} if order_id else {}
+                if order_status:
+                    shown["orderStatus"] = order_status
+                messages.append(f"✅ {name} - close {symbol}: {shown or 'OK'}")
+            else:
+                # show any server-provided error details
+                detail = err_msg or (data if data else f"HTTP {r.status_code}")
+                messages.append(f"❌ {name} - close {symbol}: {detail}")
+
+        except Exception as e:
+            messages.append(f"❌ {name} - close {symbol}: {e}")
+
+    return messages
 
 def get_holdings() -> Dict[str, Any]:
     """
@@ -511,4 +538,5 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
