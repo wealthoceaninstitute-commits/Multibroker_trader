@@ -135,6 +135,52 @@ def cancel_order_dhan(client_json: Dict[str, Any], order_id: str) -> Dict[str, A
     except Exception as e:
         return {"status": "error", "message": str(e), "raw": {}}
 
+def get_positions() -> Dict[str, List[Dict[str, Any]]]:
+    """Return Dhan positions normalized into {open:[...], closed:[...]}"""
+    positions_data: Dict[str, List[Dict[str, Any]]] = {"open": [], "closed": []}
+
+    for c in _read_clients():
+        token = (c.get("apikey") or c.get("access_token") or "").strip()
+        if not token:
+            continue
+        name = c.get("name") or c.get("display_name") or c.get("userid") or c.get("client_id") or ""
+        try:
+            resp = requests.get(
+                "https://api.dhan.co/v2/positions",
+                headers={"Content-Type": "application/json", "access-token": token},
+                timeout=10
+            )
+            rows = resp.json() if resp.status_code == 200 else []
+            if not isinstance(rows, list):
+                rows = []
+        except Exception as e:
+            print(f"[DHAN] get_positions error for {name}: {e}")
+            rows = []
+
+        for pos in rows:
+            net_qty   = pos.get("netQty", 0) or 0
+            buy_avg   = pos.get("buyAvg", 0) or 0
+            sell_avg  = pos.get("sellAvg", 0) or 0
+            symbol    = pos.get("tradingSymbol", "") or ""
+            realized  = pos.get("realizedProfit", 0) or 0
+            unreal    = pos.get("unrealizedProfit", 0) or 0
+            net_pnl   = (realized + unreal)
+
+            row = {
+                "name": name,
+                "symbol": symbol,
+                "quantity": net_qty,
+                "buy_avg": round(buy_avg, 2),
+                "sell_avg": round(sell_avg, 2),
+                "net_profit": round(net_pnl, 2),
+            }
+            if net_qty == 0:
+                positions_data["closed"].append(row)
+            else:
+                positions_data["open"].append(row)
+
+    return positions_data
+
 
 
 
@@ -538,5 +584,6 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
 
 
