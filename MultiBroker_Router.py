@@ -1084,52 +1084,65 @@ def route_get_positions():
             print(f"[router] get_positions error for {brk}: {e}")
     return buckets
 
+@app.post("/close_position")
+def route_close_position(payload: Dict[str, Any] = Body(...)):
+    """
+    Close (square-off) the selected positions.
+    Payload: { "positions": [ { "name": "<client display name>", "symbol": "<symbol>" }, ... ] }
+    Returns: {"status":"completed","message":[...],"result":{"motilal":[...], "dhan":[...]}}
+    """
+    data = payload or {}
+    items: List[Dict[str, Any]] = data.get("positions") or []
+    if not items:
+        return {"status": "completed", "message": ["❌ No positions provided"], "result": {}}
+
+    # bucket by broker using your working helper
+    bucket: Dict[str, List[Dict[str, Any]]] = {"motilal": [], "dhan": []}
+    for it in items:
+        name = (it.get("name") or "").strip()
+        symbol = (it.get("symbol") or "").strip()
+        if not name or not symbol:
+            continue
+        brk = _broker_by_client_name(name)  # <- you already have this
+        if brk in bucket:
+            bucket[brk].append({"name": name, "symbol": symbol})
+
+    out_messages: List[str] = []
+    result: Dict[str, Any] = {}
+
+    # Motilal
+    if bucket["motilal"]:
+        try:
+            mo = importlib.import_module("Broker_motilal")
+            # returns List[str] (we wrote it that way)
+            msgs = mo.close_positions(bucket["motilal"])
+        except Exception as e:
+            msgs = [f"❌ Motilal: {e}"]
+        result["motilal"] = msgs
+        out_messages.extend(msgs)
+
+    # Dhan (optional, only if you implement close there)
+    if bucket["dhan"]:
+        try:
+            dn = importlib.import_module("Broker_dhan")
+            fn = getattr(dn, "close_positions", None)
+            if callable(fn):
+                msgs = fn(bucket["dhan"])
+            else:
+                msgs = ["❌ Dhan close not implemented"]
+        except Exception as e:
+            msgs = [f"❌ Dhan: {e}"]
+        result["dhan"] = msgs
+        out_messages.extend(msgs)
+
+    # Always return a friendly, stringy list so the UI can display it
+    return {"status": "completed", "message": out_messages, "result": result}
+
+
+# Optional alias if your UI hits /close_positions
 @app.post("/close_positions")
 def route_close_positions(payload: Dict[str, Any] = Body(...)):
-    """payload: { positions: [{ name, symbol }, ...] }"""
-    items = payload.get("positions")
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="'positions' must be a list")
-
-    # bucket by broker using name
-    def _which_broker(name: str) -> str | None:
-        if not name:
-            return None
-        needle = str(name).strip().lower()
-        for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
-            try:
-                for fn in os.listdir(folder):
-                    if not fn.endswith(".json"): continue
-                    with open(os.path.join(folder, fn), "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    if (d.get("name") or d.get("display_name") or "").strip().lower() == needle:
-                        return brk
-            except FileNotFoundError:
-                pass
-        return None
-
-    buckets = {"dhan": [], "motilal": []}
-    for it in items:
-        brk = _which_broker((it or {}).get("name"))
-        if brk in buckets:
-            buckets[brk].append(it)
-
-    messages: List[str] = []
-    for brk, rows in buckets.items():
-        if not rows: continue
-        try:
-            mod = importlib.import_module("Broker_dhan" if brk == "dhan" else "Broker_motilal")
-            fn  = getattr(mod, "close_positions", None)
-            res = fn(rows) if callable(fn) else None
-            if isinstance(res, list):
-                messages.extend([str(x) for x in res])
-            elif isinstance(res, dict):
-                msgs = res.get("message") or res.get("messages") or []
-                if isinstance(msgs, list): messages.extend([str(x) for x in msgs])
-        except Exception as e:
-            messages.append(f"❌ {brk} close_positions error: {e}")
-
-    return {"message": messages}
+    return route_close_position(payload)
 @app.get("/get_holdings")
 def route_get_holdings():
     buckets = {"holdings": [], "summary": []}
@@ -1516,3 +1529,4 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
