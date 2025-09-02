@@ -86,42 +86,44 @@ def _github_sync_dir(rel_dir: str):
     if not (GITHUB_OWNER and GITHUB_REPO):
         return
     url = f"{GH_CONTENTS_URL(rel_dir)}?ref={GITHUB_BRANCH}"
-    try:
-        r = requests.get(url, headers=GH_HEADERS(), timeout=20)
-        if r.status_code != 200:
-            return
-        for item in r.json() or []:
-            if item.get("type") != "file":
+
+    r = requests.get(url, headers=GH_HEADERS(), timeout=20)
+    if r.status_code != 200:
+        return
+
+    for item in r.json() or []:
+        if item.get("type") != "file":
+            continue
+        name = item.get("name", "")
+        if not name.lower().endswith(".json"):
+            continue
+
+        dl = item.get("download_url")
+        if not dl:
+            # fallback via base64
+            f2 = requests.get(item.get("url"), headers=GH_HEADERS(), timeout=20)
+            if f2.status_code != 200:
                 continue
-            name = item.get("name", "")
-            if not name.lower().endswith(".json"):
-                continue
-            # fetch file content
-            dl = item.get("download_url")
-            if not dl:
-                # fallback via base64
-                f2 = requests.get(item.get("url"), headers=GH_HEADERS(), timeout=20)
-                if f2.status_code != 200:
-                    continue
-                j = f2.json() or {}
-                b64 = j.get("content") or ""
-                try:
-                    content = base64.b64decode(b64).decode("utf-8", "ignore")
-                except Exception:
-                    continue
-            else:
-                f2 = requests.get(dl, timeout=30)
-                if f2.status_code != 200:
-                    continue
-                content = f2.text
-            # write locally
-            local_path = os.path.join(BASE_DIR, rel_dir.replace("/", os.sep), name)
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            j = f2.json() or {}
+            b64 = j.get("content") or ""
             try:
-                with open(local_path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                content = base64.b64decode(b64).decode("utf-8", "ignore")
             except Exception:
-                pass
+                continue
+        else:
+            f2 = requests.get(dl, timeout=30)
+            if f2.status_code != 200:
+                continue
+            content = f2.text
+
+        local_path = os.path.join(BASE_DIR, rel_dir.replace("/", os.sep), name)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        try:
+            with open(local_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
 
 def _github_sync_down_all():
     for rel in ("clients/dhan", "clients/motilal", "groups", "copy_setups"):
@@ -1686,4 +1688,5 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
