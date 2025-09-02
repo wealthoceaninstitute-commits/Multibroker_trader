@@ -47,12 +47,29 @@ os.makedirs(DHAN_DIR, exist_ok=True)
 os.makedirs(MO_DIR,   exist_ok=True)
 
 app = FastAPI(title="Multi-broker Router")
+# ---- CORS (env-driven) ----
+# Put this right after: app = FastAPI(title="Multi-broker Router")
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    # comma-separated list; include your deployed frontends here
+    "https://multibrokertrader-production.up.railway.app,https://multibroker-trader.onrender.com"
+).split(",")
+
+# Always allow common local dev hosts
+DEFAULT_ORIGINS = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+}
+origins = [o.strip() for o in (ALLOWED_ORIGINS + list(DEFAULT_ORIGINS)) if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://multibroker-trader.onrender.com"],
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True
+    allow_credentials=True,
 )
 
 # --- Groups storage ---
@@ -287,6 +304,9 @@ def _save_minimal(broker: str, payload: Dict[str, Any]) -> str:
 
     path = _path_for(broker, userid)
     _save(path, doc)
+    # inside _save_minimal, after _save(path, doc)
+    print(f"[router] saved client -> {path}")
+
     return path
 
 def _update_minimal(broker: str, payload: Dict[str, Any]) -> str:
