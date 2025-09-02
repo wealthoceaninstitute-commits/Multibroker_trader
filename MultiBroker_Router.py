@@ -6,40 +6,280 @@ from fastapi.middleware.cors import CORSMiddleware
 from collections import OrderedDict
 import importlib, os, time
 import threading
-import os, sqlite3, threading, requests, tempfile, shutil
+import os, sqlite3, threading, requests
 from fastapi import Query
 import pandas as pd
-import io, zipfile
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi import UploadFile, File
 
 
 STAT_KEYS = ["pending", "traded", "rejected", "cancelled", "others"]
 summary_data_global: Dict[str, Dict[str, Any]] = {}
+SYMBOL_DB_PATH = os.path.join(os.path.abspath(os.environ.get("DATA_DIR", "./data")), "symbols.db")
+SYMBOL_TABLE   = "symbols"
+SYMBOL_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
+_symbol_db_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Persistent client storage using SQLite or PostgreSQL.
+#
+# Railway's hobby plan might not support persistent volumes. To persist
+# client information across deploys you can provide a DATABASE_URL
+# environment variable pointing at a PostgreSQL database (e.g. on
+# Railway). If no DATABASE_URL is provided, the code will fall back
+# to using a SQLite file located in BASE_DIR (named 'clients.db'). Note
+# that persisting to SQLite on the root filesystem will not survive
+# redeploys without a persistent volume.
+
+# The clients table stores minimal client data: broker, userid, name,
+# password, pan, apikey, totpkey, capital and session_active.
+
+DB_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_IS_POSTGRES = DB_URL.lower().startswith("postgres")
+
+def get_db_conn():
+    """
+    Return a new database connection.
+    - If DATABASE_URL points to a PostgreSQL database, use psycopg2 to connect.
+    - Otherwise use a SQLite file under BASE_DIR named 'clients.db'.
+    A new connection is returned each call to ensure thread-safety.
+    """
+    if DB_IS_POSTGRES:
+        try:
+            import psycopg2
+        except ImportError:
+            raise RuntimeError("psycopg2 is required for PostgreSQL connections. "
+                               "Please add 'psycopg2-binary' to your requirements.")
+        return psycopg2.connect(DB_URL)
+    else:
+        # For SQLite we allow cross-thread usage by disabling same thread check.
+        db_path = os.path.join(BASE_DIR, "clients.db")
+        return sqlite3.connect(db_path, check_same_thread=False)
+
+def init_clients_db():
+    """Ensure the clients table exists in the configured database."""
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if DB_IS_POSTGRES:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    broker TEXT NOT NULL,
+                    userid TEXT NOT NULL,
+                    name TEXT,
+                    password TEXT,
+                    pan TEXT,
+                    apikey TEXT,
+                    totpkey TEXT,
+                    capital TEXT,
+                    session_active BOOLEAN,
+                    PRIMARY KEY (broker, userid)
+                );
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    broker TEXT NOT NULL,
+                    userid TEXT NOT NULL,
+                    name TEXT,
+                    password TEXT,
+                    pan TEXT,
+                    apikey TEXT,
+                    totpkey TEXT,
+                    capital TEXT,
+                    session_active INTEGER,
+                    UNIQUE(broker, userid)
+                );
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+def _db_upsert_client(broker: str, userid: str, doc: Dict[str, Any]):
+    """
+    Insert or update a client record.
+    If a record with the same broker/userid exists, update it with new values.
+    """
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if DB_IS_POSTGRES:
+            cur.execute("""
+                INSERT INTO clients (broker, userid, name, password, pan, apikey, totpkey, capital, session_active)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (broker, userid) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    password = EXCLUDED.password,
+                    pan = EXCLUDED.pan,
+                    apikey = EXCLUDED.apikey,
+                    totpkey = EXCLUDED.totpkey,
+                    capital = EXCLUDED.capital,
+                    session_active = EXCLUDED.session_active;
+            """, (
+                broker, userid,
+                doc.get("name"), doc.get("password"),
+                doc.get("pan"), doc.get("apikey"),
+                doc.get("totpkey"), str(doc.get("capital", "")),
+                bool(doc.get("session_active", False))
+            ))
+        else:
+            cur.execute("""
+                INSERT OR REPLACE INTO clients
+                    (broker, userid, name, password, pan, apikey, totpkey, capital, session_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                broker, userid,
+                doc.get("name"), doc.get("password"),
+                doc.get("pan"), doc.get("apikey"),
+                doc.get("totpkey"), str(doc.get("capital", "")),
+                1 if bool(doc.get("session_active", False)) else 0
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _db_get_client(broker: str, userid: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single client record by broker and userid."""
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if DB_IS_POSTGRES:
+            cur.execute("""
+                SELECT broker, userid, name, password, pan, apikey, totpkey, capital, session_active
+                FROM clients
+                WHERE broker = %s AND userid = %s
+            """, (broker, userid))
+        else:
+            cur.execute("""
+                SELECT broker, userid, name, password, pan, apikey, totpkey, capital, session_active
+                FROM clients
+                WHERE broker = ? AND userid = ?
+            """, (broker, userid))
+        row = cur.fetchone()
+        if not row:
+            return None
+        doc = {
+            "broker": row[0],
+            "userid": row[1],
+            "name": row[2],
+            "password": row[3],
+            "pan": row[4],
+            "apikey": row[5],
+            "totpkey": row[6],
+            "capital": row[7],
+            "session_active": bool(row[8])
+        }
+        return doc
+    finally:
+        conn.close()
+
+def _db_delete_client(broker: str, userid: str) -> bool:
+    """
+    Remove a client record. Returns True if deleted, False if not found.
+    """
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if DB_IS_POSTGRES:
+            cur.execute("DELETE FROM clients WHERE broker = %s AND userid = %s", (broker, userid))
+        else:
+            cur.execute("DELETE FROM clients WHERE broker = ? AND userid = ?", (broker, userid))
+        deleted = cur.rowcount
+        conn.commit()
+        return deleted > 0
+    finally:
+        conn.close()
+
+def _db_list_clients() -> List[Dict[str, Any]]:
+    """Return all client rows as a list of dicts."""
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        # same query for both DB types
+        cur.execute("SELECT broker, userid, name, capital, session_active FROM clients")
+        rows = cur.fetchall()
+        clients: List[Dict[str, Any]] = []
+        for row in rows:
+            clients.append({
+                "broker": row[0],
+                "userid": row[1],
+                "name": row[2] or "",
+                "capital": row[3] or "",
+                "session_active": bool(row[4])
+            })
+        return clients
+    finally:
+        conn.close()
+
+def _db_find_broker_by_client_name(name: str) -> Optional[str]:
+    """
+    Resolve a broker for a given client name (case-insensitive exact match on
+    name or userid). Returns the broker string or None if not found.
+    """
+    if not name:
+        return None
+    needle = str(name).strip()
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if DB_IS_POSTGRES:
+            cur.execute("""
+                SELECT broker FROM clients
+                WHERE LOWER(name) = LOWER(%s) OR LOWER(userid) = LOWER(%s)
+                LIMIT 1
+            """, (needle, needle))
+        else:
+            cur.execute("""
+                SELECT broker FROM clients
+                WHERE lower(name) = lower(?) OR lower(userid) = lower(?)
+                LIMIT 1
+            """, (needle, needle))
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+def _db_get_client_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """Return the first client record matching the given name (case-insensitive)."""
+    if not name:
+        return None
+    needle = str(name).strip()
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if DB_IS_POSTGRES:
+            cur.execute("""
+                SELECT broker, userid, name, password, pan, apikey, totpkey, capital, session_active
+                FROM clients
+                WHERE LOWER(name) = LOWER(%s)
+                LIMIT 1
+            """, (needle,))
+        else:
+            cur.execute("""
+                SELECT broker, userid, name, password, pan, apikey, totpkey, capital, session_active
+                FROM clients
+                WHERE lower(name) = lower(?)
+                LIMIT 1
+            """, (needle,))
+        row = cur.fetchone()
+        if row:
+            doc = {
+                "broker": row[0],
+                "userid": row[1],
+                "name": row[2],
+                "password": row[3],
+                "pan": row[4],
+                "apikey": row[5],
+                "totpkey": row[6],
+                "capital": row[7],
+                "session_active": bool(row[8])
+            }
+            return doc
+        return None
+    finally:
+        conn.close()
 
 
-
-
-def _pick_data_root() -> str:
-    # Priority 1: explicit env var
-    env_dir = os.environ.get("DATA_DIR")
-    if env_dir:
-        return os.path.abspath(env_dir)
-
-    # Priority 2: Railway persistent path
-    if os.path.isdir("/mnt/data"):
-        return "/mnt/data"
-
-    # Priority 3: Render disk (if attached)
-    if os.path.isdir("/var/data"):
-        return "/var/data"
-
-    # Fallback: local ./data (ephemeral on free tiers)
-    return os.path.abspath("./data")
-
-BASE_DIR = _pick_data_root()
-
-# --- Clients storage ---
+# -------- Option B storage --------
+BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
 CLIENTS_ROOT = os.path.join(BASE_DIR, "clients")
 DHAN_DIR     = os.path.join(CLIENTS_ROOT, "dhan")
 MO_DIR       = os.path.join(CLIENTS_ROOT, "motilal")
@@ -47,32 +287,12 @@ os.makedirs(DHAN_DIR, exist_ok=True)
 os.makedirs(MO_DIR,   exist_ok=True)
 
 app = FastAPI(title="Multi-broker Router")
-# ---- CORS (env-driven) ----
-# Put this right after: app = FastAPI(title="Multi-broker Router")
-ALLOWED_ORIGINS = os.environ.get(
-    "ALLOWED_ORIGINS",
-    # comma-separated list; include your deployed frontends here
-    "https://multibrokertrader-production.up.railway.app,https://multibroker-trader.onrender.com"
-).split(",")
-
-# Always allow common local dev hosts
-DEFAULT_ORIGINS = {
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-}
-origins = [o.strip() for o in (ALLOWED_ORIGINS + list(DEFAULT_ORIGINS)) if o.strip()]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
+    allow_origins=["https://multibroker-trader.onrender.com"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
-# --- Groups storage ---
+# --- Groups storage (simple) ---
 GROUPS_ROOT = os.path.join(BASE_DIR, "groups")
 os.makedirs(GROUPS_ROOT, exist_ok=True)
 
@@ -80,44 +300,19 @@ def _group_path(group_id_or_name: str) -> str:
     """Return path for a group json, using safe id/name."""
     return os.path.join(GROUPS_ROOT, f"{_safe(group_id_or_name)}.json")
 
-# --- Copy Trading storage ---
+# --- Copy Trading storage (file-based) ---
 COPY_ROOT = os.path.join(BASE_DIR, "copy_setups")
 os.makedirs(COPY_ROOT, exist_ok=True)
 
 def _copy_path(setup_id: str) -> str:
     return os.path.join(COPY_ROOT, f"{_safe(setup_id)}.json")
 
-# --- Safe JSON helpers ---
-def _write_json_atomic(dest_path: str, data: dict) -> None:
-    """Write JSON safely: write to temp then replace."""
-    folder = os.path.dirname(dest_path)
-    os.makedirs(folder, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=folder)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, dest_path)
-    finally:
-        if os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except OSError: pass
-
-def _read_json(path: str, default=None):
+def _read_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except FileNotFoundError:
-        return {} if default is None else default
-    
-
-
-# --- Symbols DB (SQLite) ---
-SYMBOL_DB_PATH = os.path.join(BASE_DIR, "symbols.db")
-SYMBOL_TABLE   = "symbols"
-SYMBOL_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
-_symbol_db_lock = threading.Lock()
+    except Exception:
+        return {}
 
 
 
@@ -232,7 +427,17 @@ def router_search_symbols(q: str = Query(""), exchange: str = Query("")):
 
 @app.on_event("startup")
 def _symbols_startup():
+    """
+    Application startup hook. Initializes the symbols database (SQLite) and
+    the clients database (SQLite or PostgreSQL depending on DATABASE_URL).
+    """
     _lazy_init_symbol_db()
+    # initialize clients DB once at startup
+    try:
+        init_clients_db()
+    except Exception as e:
+        # log but do not crash the app on DB init failure
+        print(f"[startup] client DB init error: {e}")
 
 
 def _safe(s: str) -> str:
@@ -255,17 +460,15 @@ def _path_for(broker: str, userid: str) -> str:
 def _load(path: str) -> Dict[str, Any]:
     with open(path, "r") as f: return json.load(f)
 
-# replace the current _save with this
 def _save(path: str, data: Dict[str, Any]):
-    _write_json_atomic(path, data)
-
+    with open(path, "w") as f: json.dump(data, f, indent=4)
 
 # ---------- minimal save (no hard failures) ----------
-def _save_minimal(broker: str, payload: Dict[str, Any]) -> str:
+def _save_minimal(broker: str, payload: Dict[str, Any]) -> Any:
     """
     Save ONLY modal fields + session_active.
-    motilal: name, userid, password, pan, apikey, totpkey, capital, session_active
-    dhan:    name, userid, apikey, capital, session_active
+    For DB storage, upsert the client row. For file-based fallback, write a JSON file.
+    Returns a DB identifier (userid) or a file path.
     """
     userid = _pick(payload.get("userid"), payload.get("client_id"))
     if not userid:
@@ -286,14 +489,14 @@ def _save_minimal(broker: str, payload: Dict[str, Any]) -> str:
             "name": name,
             "userid": userid,
             "password": _pick(payload.get("password"), creds.get("password")),
-            # ← NEW: accept pan from multiple places / casings
+            # accept pan from multiple places / casings
             "pan": _pick(payload.get("pan"), creds.get("pan"), creds.get("PAN")),
-            # ← NEW: accept apikey from multiple places / casings
+            # accept apikey from multiple places / casings
             "apikey": _pick(
                 payload.get("apikey"),
                 creds.get("apikey"), creds.get("api_key"), creds.get("apiKey")
             ),
-            # already worked via creds.mpin, keep plus more fallbacks
+            # accept totp/otp/mpin keys
             "totpkey": _pick(
                 payload.get("totpkey"),
                 creds.get("totpkey"), creds.get("mpin"), creds.get("otp")
@@ -302,81 +505,127 @@ def _save_minimal(broker: str, payload: Dict[str, Any]) -> str:
             "session_active": bool(payload.get("session_active", False)),
         }
 
-    path = _path_for(broker, userid)
-    _save(path, doc)
-    # inside _save_minimal, after _save(path, doc)
-    print(f"[router] saved client -> {path}")
+    # Use DB if available
+    if DB_URL:
+        # upsert into database
+        _db_upsert_client(broker, userid, doc)
+        return userid
+    else:
+        # fallback to file-based storage (non-persistent without volume)
+        path = _path_for(broker, userid)
+        _save(path, doc)
+        return path
 
-    return path
-
-def _update_minimal(broker: str, payload: Dict[str, Any]) -> str:
+def _update_minimal(broker: str, payload: Dict[str, Any]) -> Any:
     """
     Update ONLY modal fields + session_active.
     - Preserves existing non-empty values when new values are empty/missing.
-    - Supports userid/broker change (renames/moves file).
-    Optional fields for rename:
-      original_userid, original_broker
+    - Supports userid/broker change (renames/moves).
+    Returns the identifier (userid) or file path, depending on storage.
     """
     # Where the record *was* (if provided)
     old_userid  = _pick(payload.get("original_userid"), payload.get("old_userid"))
     old_broker  = (_pick(payload.get("original_broker"), payload.get("old_broker")) or broker).lower()
-    old_path    = _path_for(old_broker, old_userid) if old_userid else None
 
     # Where the record *should be* after edit
     userid      = _pick(payload.get("userid"), payload.get("client_id"), old_userid)
     if not userid:
         raise HTTPException(status_code=400, detail="client_id / userid is required for edit")
     name        = _pick(payload.get("name"), payload.get("display_name"), userid)
-    new_path    = _path_for(broker, userid)
 
-    # Load what we already have (prefer old if exists, otherwise new)
-    existing: Dict[str, Any] = {}
-    try:
-        if old_path and os.path.exists(old_path):
-            existing = _load(old_path)
-        elif os.path.exists(new_path):
-            existing = _load(new_path)
-    except Exception:
-        existing = {}
+    # If using a DB, load existing values from DB
+    if DB_URL:
+        existing: Dict[str, Any] = {}
+        if old_userid:
+            existing = _db_get_client(old_broker, old_userid) or {}
+        else:
+            existing = _db_get_client(broker, userid) or {}
 
-    # Build merged doc (keep existing field when new candidate is empty)
-    if broker == "dhan":
-        doc = {
-            "name":           _pick(name, existing.get("name")),
-            "userid":         userid,
-            "apikey":         _pick(payload.get("apikey"),
-                                    (payload.get("creds") or {}).get("access_token"),
-                                    existing.get("apikey")),
-            "capital":        payload.get("capital", existing.get("capital")),
-            "session_active": bool(payload.get("session_active", existing.get("session_active", False))),
-        }
-    else:  # motilal
-        creds = payload.get("creds") or {}
-        doc = {
-            "name":           _pick(name, existing.get("name")),
-            "userid":         userid,
-            "password":       _pick(payload.get("password"), creds.get("password"), existing.get("password")),
-            "pan":            _pick(payload.get("pan"), creds.get("pan"), creds.get("PAN"), existing.get("pan")),
-            "apikey":         _pick(payload.get("apikey"), creds.get("apikey"), creds.get("api_key"),
-                                    creds.get("apiKey"), existing.get("apikey")),
-            "totpkey":        _pick(payload.get("totpkey"), creds.get("totpkey"), creds.get("mpin"),
-                                    creds.get("otp"), existing.get("totpkey")),
-            "capital":        payload.get("capital", existing.get("capital")),
-            "session_active": bool(payload.get("session_active", existing.get("session_active", False))),
-        }
+        # Build merged doc (keep existing field when new candidate is empty)
+        if broker == "dhan":
+            doc = {
+                "name":           _pick(name, existing.get("name")),
+                "userid":         userid,
+                "apikey":         _pick(payload.get("apikey"),
+                                            (payload.get("creds") or {}).get("access_token"),
+                                            existing.get("apikey")),
+                "capital":        payload.get("capital", existing.get("capital")),
+                "session_active": bool(payload.get("session_active", existing.get("session_active", False))),
+            }
+        else:  # motilal
+            creds = payload.get("creds") or {}
+            doc = {
+                "name":           _pick(name, existing.get("name")),
+                "userid":         userid,
+                "password":       _pick(payload.get("password"), creds.get("password"), existing.get("password")),
+                "pan":            _pick(payload.get("pan"), creds.get("pan"), creds.get("PAN"), existing.get("pan")),
+                "apikey":         _pick(payload.get("apikey"), creds.get("apikey"), creds.get("api_key"),
+                                            creds.get("apiKey"), existing.get("apikey")),
+                "totpkey":        _pick(payload.get("totpkey"), creds.get("totpkey"), creds.get("mpin"),
+                                            creds.get("otp"), existing.get("totpkey")),
+                "capital":        payload.get("capital", existing.get("capital")),
+                "session_active": bool(payload.get("session_active", existing.get("session_active", False))),
+            }
 
-    # Write new file
-    _save(new_path, doc)
+        # If key changed, delete old record
+        if old_userid and (old_broker != broker or old_userid != userid):
+            _db_delete_client(old_broker, old_userid)
+        # Upsert new record
+        _db_upsert_client(broker, userid, doc)
+        return userid
+    else:
+        # File-based fallback: preserve existing values from files
+        old_path    = _path_for(old_broker, old_userid) if old_userid else None
+        new_path    = _path_for(broker, userid)
 
-    # If we changed userid/broker, remove the old file
-    if old_path and os.path.abspath(old_path) != os.path.abspath(new_path):
+        # Load what we already have (prefer old if exists, otherwise new)
+        existing: Dict[str, Any] = {}
         try:
-            if os.path.exists(old_path):
-                os.remove(old_path)
+            if old_path and os.path.exists(old_path):
+                existing = _load(old_path)
+            elif os.path.exists(new_path):
+                existing = _load(new_path)
         except Exception:
-            pass
+            existing = {}
 
-    return new_path
+        # Build merged doc (keep existing field when new candidate is empty)
+        if broker == "dhan":
+            doc = {
+                "name":           _pick(name, existing.get("name")),
+                "userid":         userid,
+                "apikey":         _pick(payload.get("apikey"),
+                                        (payload.get("creds") or {}).get("access_token"),
+                                        existing.get("apikey")),
+                "capital":        payload.get("capital", existing.get("capital")),
+                "session_active": bool(payload.get("session_active", existing.get("session_active", False))),
+            }
+        else:  # motilal
+            creds = payload.get("creds") or {}
+            doc = {
+                "name":           _pick(name, existing.get("name")),
+                "userid":         userid,
+                "password":       _pick(payload.get("password"), creds.get("password"), existing.get("password")),
+                "pan":            _pick(payload.get("pan"), creds.get("pan"), creds.get("PAN"), existing.get("pan")),
+                "apikey":         _pick(payload.get("apikey"), creds.get("apikey"), creds.get("api_key"),
+                                        creds.get("apiKey"), existing.get("apikey")),
+                "totpkey":        _pick(payload.get("totpkey"), creds.get("totpkey"), creds.get("mpin"),
+                                        creds.get("otp"), existing.get("totpkey")),
+                "capital":        payload.get("capital", existing.get("capital")),
+                "session_active": bool(payload.get("session_active", existing.get("session_active", False))),
+            }
+
+        # Write new file
+        _save(new_path, doc)
+
+        # If we changed userid/broker, remove the old file
+        if old_path and os.path.abspath(old_path) != os.path.abspath(new_path):
+            try:
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+            except Exception:
+                pass
+
+        return new_path
 
 
 def _has_required_for_login(broker: str, c: Dict[str, Any]) -> bool:
@@ -389,18 +638,31 @@ def _has_required_for_login(broker: str, c: Dict[str, Any]) -> bool:
         (c.get("totpkey") or "").strip()
     ))
 
-def _dispatch_login(broker: str, path: str):
+def _dispatch_login(broker: str, identifier: str):
     """
-    Import Broker_* module and call login(client).
-    If module is absent or fields insufficient, skip cleanly.
+    Import the appropriate Broker_* module and call its login(client) function.
+    - In DB mode, `identifier` is the userid. The client record is loaded from the DB.
+    - In file mode, `identifier` is the JSON file path. The client record is loaded from the file.
+    After a successful login (returns truthy), update session_active accordingly.
     """
     try:
-        client = _load(path)
+        # Load client record from DB or JSON
+        if DB_URL:
+            # identifier is userid
+            userid = identifier
+            client = _db_get_client(broker, userid) or {}
+            if not client:
+                print(f"[router] skip login ({broker}/{userid}): client not found in DB")
+                return
+        else:
+            # identifier is file path
+            client = _load(identifier)
+        # Validate required fields
         if not _has_required_for_login(broker, client):
             print(f"[router] skip login ({broker}/{client.get('userid')}): missing fields")
             return
 
-        # dynamic import by filename:
+        # dynamic import by filename
         mod_name = "Broker_dhan" if broker == "dhan" else "Broker_motilal"
         mod = importlib.import_module(mod_name)
         login_fn = getattr(mod, "login", None)
@@ -410,17 +672,32 @@ def _dispatch_login(broker: str, path: str):
 
         ok = bool(login_fn(client))
         client["session_active"] = ok
-        _save(path, client)
+        # Save updated session state
+        if DB_URL:
+            _db_upsert_client(broker, client.get("userid"), client)
+        else:
+            _save(identifier, client)
     except ModuleNotFoundError:
         print(f"[router] module for {broker} not found (Broker_dhan.py / Broker_motilal.py); saved only")
     except Exception as e:
         print(f"[router] login error ({broker}): {e}")
 
 def _delete_client_file(broker: str, userid: str) -> bool:
-    """Remove a single client's JSON file. Returns True if deleted, False if it didn't exist."""
+    """
+    Remove a single client's record.
+    For DB storage, delete the row. For file storage, remove the JSON file.
+    Returns True if deleted, False if it didn't exist.
+    """
     broker = (broker or "").lower()
     if not broker or not userid:
         raise HTTPException(status_code=400, detail="broker and userid are required")
+
+    if DB_URL:
+        try:
+            return _db_delete_client(broker, userid)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed deleting {broker}/{userid}: {e}")
+    # file-based fallback
     path = _path_for(broker, userid)
     try:
         os.remove(path)
@@ -431,6 +708,12 @@ def _delete_client_file(broker: str, userid: str) -> bool:
         raise HTTPException(status_code=500,
                             detail=f"Failed deleting {broker}/{userid}: {e}")
 
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 def _list_groups() -> list[dict]:
     items = []
@@ -580,52 +863,22 @@ def health():
             status[key] = f"error: {e}"
     return {"ok": True, "brokers": status}
 
-@app.get("/backup_all")
-def backup_all():
-    """
-    Create a ZIP containing all persistent JSONs (clients, groups, copy_setups)
-    plus symbols.db if present.
-    """
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # walk through relevant dirs
-        for root, dirs, files in os.walk(BASE_DIR):
-            for fn in files:
-                path = os.path.join(root, fn)
-                rel  = os.path.relpath(path, BASE_DIR)
-                try:
-                    zf.write(path, rel)
-                except Exception as e:
-                    print(f"[backup] skip {path}: {e}")
-    buf.seek(0)
-    return StreamingResponse(buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=backup_{int(time.time())}.zip"}
-    )
-
-@app.post("/restore_all")
-async def restore_all(file: UploadFile = File(...)):
-    """
-    Restore from a ZIP previously created with /backup_all.
-    Overwrites existing files. Use with care!
-    """
-    try:
-        contents = await file.read()
-        buf = io.BytesIO(contents)
-        with zipfile.ZipFile(buf, "r") as zf:
-            zf.extractall(BASE_DIR)
-        return {"success": True, "message": "Restore completed."}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
-
 @app.post("/add_client")
 def add_client(background_tasks: BackgroundTasks, payload: Dict[str, Any] = Body(...)):
     broker = (_pick(payload.get("broker")) or "motilal").lower()
     if broker not in ("dhan", "motilal"):
         raise HTTPException(status_code=400, detail=f"Unknown broker '{broker}'")
-
-    path = _save_minimal(broker, payload)
-    background_tasks.add_task(_dispatch_login, broker, path)
+    # Persist the client (DB or file)
+    _save_minimal(broker, payload)
+    # Determine identifier: for DB mode use userid, for file mode use file path
+    if DB_URL:
+        userid = _pick(payload.get("userid"), payload.get("client_id"))
+        background_tasks.add_task(_dispatch_login, broker, userid)
+    else:
+        # fallback: compute file path and pass to login
+        userid = _pick(payload.get("userid"), payload.get("client_id"))
+        path = _path_for(broker, userid)
+        background_tasks.add_task(_dispatch_login, broker, path)
     return {"success": True, "message": f"Saved for {broker}. Login started if fields complete."}
 
 @app.post("/edit_client")
@@ -638,31 +891,58 @@ def edit_client(background_tasks: BackgroundTasks, payload: Dict[str, Any] = Bod
     broker = (_pick(payload.get("broker")) or "motilal").lower()
     if broker not in ("dhan", "motilal"):
         raise HTTPException(status_code=400, detail=f"Unknown broker '{broker}'")
-
-    path = _update_minimal(broker, payload)
-    background_tasks.add_task(_dispatch_login, broker, path)
+    identifier = _update_minimal(broker, payload)
+    # Schedule login using the appropriate identifier
+    if DB_URL:
+        # identifier is userid
+        background_tasks.add_task(_dispatch_login, broker, identifier)
+    else:
+        # identifier is file path
+        background_tasks.add_task(_dispatch_login, broker, identifier)
     return {"success": True, "message": f"Updated for {broker}. Login started if fields complete."}
 
 
 @app.get("/clients")
 def clients_rows():
-    rows: List[Dict[str, Any]] = []
-    for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
-        for fn in os.listdir(folder):
-            if not fn.endswith(".json"): continue
-            try:
-                with open(os.path.join(folder, fn), "r") as f: d = json.load(f)
-                rows.append({
-                    "name": d.get("name",""),
-                    "display_name": d.get("name",""),
-                    "client_id": d.get("userid",""),
-                    "capital": d.get("capital",""),
-                    "status": "logged_in" if d.get("session_active") else "logged_out",
-                    "session_active": bool(d.get("session_active", False)),
-                    "broker": brk
-                })
-            except: pass
-    return rows
+    """
+    Return a list of client rows for UI. If a database is configured, fetch
+    clients from the DB; otherwise fall back to scanning JSON files.
+    """
+    if DB_URL:
+        try:
+            records = _db_list_clients()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to list clients: {e}")
+        rows: List[Dict[str, Any]] = []
+        for rec in records:
+            rows.append({
+                "name": rec.get("name", ""),
+                "display_name": rec.get("name", ""),
+                "client_id": rec.get("userid", ""),
+                "capital": rec.get("capital", ""),
+                "status": "logged_in" if rec.get("session_active") else "logged_out",
+                "session_active": bool(rec.get("session_active", False)),
+                "broker": rec.get("broker", "")
+            })
+        return rows
+    else:
+        rows: List[Dict[str, Any]] = []
+        for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
+            for fn in os.listdir(folder):
+                if not fn.endswith(".json"): continue
+                try:
+                    with open(os.path.join(folder, fn), "r") as f: d = json.load(f)
+                    rows.append({
+                        "name": d.get("name",""),
+                        "display_name": d.get("name",""),
+                        "client_id": d.get("userid",""),
+                        "capital": d.get("capital",""),
+                        "status": "logged_in" if d.get("session_active") else "logged_out",
+                        "session_active": bool(d.get("session_active", False)),
+                        "broker": brk
+                    })
+                except: pass
+        return rows
 
 @app.get("/get_clients")
 def get_clients_legacy():
@@ -1013,6 +1293,11 @@ def _guess_broker_from_order(order: Dict[str, Any]) -> str | None:
 def _broker_by_client_name(name: str) -> str | None:
     if not name:
         return None
+    # DB-enabled lookup
+    if DB_URL:
+        br = _db_find_broker_by_client_name(name)
+        return br
+    # file-based fallback
     needle = str(name).strip().lower()
     for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
         try:
@@ -1088,6 +1373,12 @@ def route_cancel_order(payload: Dict[str, Any] = Body(...)):
             else:
                 # Fallback: call single-order helper cancel_order_dhan(...)
                 def _load_dhan_json(name: str) -> Optional[Dict[str, Any]]:
+                    """
+                    Load a Dhan client record by name.
+                    When a database is configured, fetch from DB; otherwise read JSON file.
+                    """
+                    if DB_URL:
+                        return _db_get_client_by_name(name)
                     needle = (name or "").strip().lower()
                     try:
                         for fn in os.listdir(DHAN_DIR):
@@ -1194,20 +1485,8 @@ def route_close_positions(payload: Dict[str, Any] = Body(...)):
 
     # bucket by broker using name
     def _which_broker(name: str) -> str | None:
-        if not name:
-            return None
-        needle = str(name).strip().lower()
-        for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
-            try:
-                for fn in os.listdir(folder):
-                    if not fn.endswith(".json"): continue
-                    with open(os.path.join(folder, fn), "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    if (d.get("name") or d.get("display_name") or "").strip().lower() == needle:
-                        return brk
-            except FileNotFoundError:
-                pass
-        return None
+        """Resolve broker by client name using DB-aware helper."""
+        return _broker_by_client_name(name)
 
     buckets = {"dhan": [], "motilal": []}
     for it in items:
@@ -1362,26 +1641,51 @@ def route_place_orders(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="Trigger price is required for SL/SL-M orders.")
 
     # ------------------- client index (userid -> broker/name/json) -------------------
-   
-
+    # Build an index of clients from either the configured database or from
+    # local JSON files. When a database is configured via DATABASE_URL, only
+    # the minimal fields (broker, userid, name) are loaded; JSON records are
+    # ignored since they are not used by place_orders. If no database is
+    # configured, fall back to scanning the Dhan and Motilal client folders.
     def _index_clients() -> Dict[str, Dict[str, Any]]:
         idx: Dict[str, Dict[str, Any]] = {}
-        for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
+        if DB_URL:
+            # Database-backed: query the clients table for userid, broker, name.
             try:
-                for fn in os.listdir(folder):
-                    if not fn.endswith(".json"):
+                records = _db_list_clients()
+                for rec in records:
+                    uid = str(rec.get("userid") or "").strip()
+                    if not uid:
                         continue
-                    with open(os.path.join(folder, fn), "r", encoding="utf-8") as f:
-                        cj = json.load(f)
-                    uid = str(cj.get("userid") or cj.get("client_id") or "").strip()
-                    if uid:
-                        idx[uid] = {
-                            "broker": brk,
-                            "json": cj,
-                            "name": cj.get("name") or cj.get("display_name") or uid,
-                        }
-            except FileNotFoundError:
-                continue
+                    idx[uid] = {
+                        "broker": rec.get("broker"),
+                        # default name to userid if name is missing
+                        "name": rec.get("name") or uid,
+                        "json": None
+                    }
+            except Exception:
+                # On any failure, return what has been built so far (may be empty).
+                return idx
+        else:
+            # File-backed fallback: scan JSON files in Dhan and Motilal folders
+            for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
+                try:
+                    for fn in os.listdir(folder):
+                        if not fn.endswith(".json"):
+                            continue
+                        try:
+                            with open(os.path.join(folder, fn), "r", encoding="utf-8") as f:
+                                cj = json.load(f)
+                        except Exception:
+                            continue
+                        uid = str(cj.get("userid") or cj.get("client_id") or "").strip()
+                        if uid:
+                            idx[uid] = {
+                                "broker": brk,
+                                "name": cj.get("name") or cj.get("display_name") or uid,
+                                "json": cj
+                            }
+                except FileNotFoundError:
+                    continue
         return idx
 
     client_index = _index_clients()
@@ -1506,8 +1810,10 @@ def route_place_orders(payload: Dict[str, Any] = Body(...)):
             return out
 
         for gsel in groups:
-            gp = (globals().get("_find_group_path")(gsel)
-                  or os.path.join(GROUPS_ROOT, f"{str(gsel).replace(' ', '_')}.json"))
+            gp = (
+                globals().get("_find_group_path")(gsel)
+                or os.path.join(GROUPS_ROOT, f"{str(gsel).replace(' ', '_')}.json")
+            )
             if not gp or not os.path.exists(gp):
                 per_client_orders.append({"_skip": True, "reason": f"group_file_missing:{gsel}"})
                 continue
