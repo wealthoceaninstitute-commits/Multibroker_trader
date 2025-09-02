@@ -7,4 +7,7 @@ pandas==2.2.2
 geocoder==1.38.1
 websocket-client==1.8.0
 pyotp
+python-multipart>=0.0.9
+
+
 
