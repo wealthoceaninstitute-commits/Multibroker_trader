@@ -6,21 +6,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from collections import OrderedDict
 import importlib, os, time
 import threading
-import os, sqlite3, threading, requests
+import os, sqlite3, threading, requests, tempfile, shutil
 from fastapi import Query
 import pandas as pd
+import io, zipfile
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import UploadFile, File
 
 
 STAT_KEYS = ["pending", "traded", "rejected", "cancelled", "others"]
 summary_data_global: Dict[str, Dict[str, Any]] = {}
-SYMBOL_DB_PATH = os.path.join(os.path.abspath(os.environ.get("DATA_DIR", "./data")), "symbols.db")
-SYMBOL_TABLE   = "symbols"
-SYMBOL_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
-_symbol_db_lock = threading.Lock()
 
 
-# -------- Option B storage --------
-BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
+
+
+def _pick_data_root() -> str:
+    # Priority 1: explicit env var
+    env_dir = os.environ.get("DATA_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    # Priority 2: Railway persistent path
+    if os.path.isdir("/mnt/data"):
+        return "/mnt/data"
+
+    # Priority 3: Render disk (if attached)
+    if os.path.isdir("/var/data"):
+        return "/var/data"
+
+    # Fallback: local ./data (ephemeral on free tiers)
+    return os.path.abspath("./data")
+
+BASE_DIR = _pick_data_root()
+
+# --- Clients storage ---
 CLIENTS_ROOT = os.path.join(BASE_DIR, "clients")
 DHAN_DIR     = os.path.join(CLIENTS_ROOT, "dhan")
 MO_DIR       = os.path.join(CLIENTS_ROOT, "motilal")
@@ -30,10 +49,13 @@ os.makedirs(MO_DIR,   exist_ok=True)
 app = FastAPI(title="Multi-broker Router")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=["https://multibroker-trader.onrender.com"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True
 )
 
-# --- Groups storage (simple) ---
+# --- Groups storage ---
 GROUPS_ROOT = os.path.join(BASE_DIR, "groups")
 os.makedirs(GROUPS_ROOT, exist_ok=True)
 
@@ -41,19 +63,44 @@ def _group_path(group_id_or_name: str) -> str:
     """Return path for a group json, using safe id/name."""
     return os.path.join(GROUPS_ROOT, f"{_safe(group_id_or_name)}.json")
 
-# --- Copy Trading storage (file-based) ---
+# --- Copy Trading storage ---
 COPY_ROOT = os.path.join(BASE_DIR, "copy_setups")
 os.makedirs(COPY_ROOT, exist_ok=True)
 
 def _copy_path(setup_id: str) -> str:
     return os.path.join(COPY_ROOT, f"{_safe(setup_id)}.json")
 
-def _read_json(path: str) -> Dict[str, Any]:
+# --- Safe JSON helpers ---
+def _write_json_atomic(dest_path: str, data: dict) -> None:
+    """Write JSON safely: write to temp then replace."""
+    folder = os.path.dirname(dest_path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, dest_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except OSError: pass
+
+def _read_json(path: str, default=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return {}
+    except FileNotFoundError:
+        return {} if default is None else default
+    
+
+
+# --- Symbols DB (SQLite) ---
+SYMBOL_DB_PATH = os.path.join(BASE_DIR, "symbols.db")
+SYMBOL_TABLE   = "symbols"
+SYMBOL_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
+_symbol_db_lock = threading.Lock()
 
 
 
@@ -191,8 +238,10 @@ def _path_for(broker: str, userid: str) -> str:
 def _load(path: str) -> Dict[str, Any]:
     with open(path, "r") as f: return json.load(f)
 
+# replace the current _save with this
 def _save(path: str, data: Dict[str, Any]):
-    with open(path, "w") as f: json.dump(data, f, indent=4)
+    _write_json_atomic(path, data)
+
 
 # ---------- minimal save (no hard failures) ----------
 def _save_minimal(broker: str, payload: Dict[str, Any]) -> str:
@@ -362,12 +411,6 @@ def _delete_client_file(broker: str, userid: str) -> bool:
         raise HTTPException(status_code=500,
                             detail=f"Failed deleting {broker}/{userid}: {e}")
 
-def _read_json(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
 
 def _list_groups() -> list[dict]:
     items = []
@@ -516,6 +559,44 @@ def health():
         except Exception as e:
             status[key] = f"error: {e}"
     return {"ok": True, "brokers": status}
+
+@app.get("/backup_all")
+def backup_all():
+    """
+    Create a ZIP containing all persistent JSONs (clients, groups, copy_setups)
+    plus symbols.db if present.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # walk through relevant dirs
+        for root, dirs, files in os.walk(BASE_DIR):
+            for fn in files:
+                path = os.path.join(root, fn)
+                rel  = os.path.relpath(path, BASE_DIR)
+                try:
+                    zf.write(path, rel)
+                except Exception as e:
+                    print(f"[backup] skip {path}: {e}")
+    buf.seek(0)
+    return StreamingResponse(buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=backup_{int(time.time())}.zip"}
+    )
+
+@app.post("/restore_all")
+async def restore_all(file: UploadFile = File(...)):
+    """
+    Restore from a ZIP previously created with /backup_all.
+    Overwrites existing files. Use with care!
+    """
+    try:
+        contents = await file.read()
+        buf = io.BytesIO(contents)
+        with zipfile.ZipFile(buf, "r") as zf:
+            zf.extractall(BASE_DIR)
+        return {"success": True, "message": "Restore completed."}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 @app.post("/add_client")
 def add_client(background_tasks: BackgroundTasks, payload: Dict[str, Any] = Body(...)):
@@ -1084,65 +1165,52 @@ def route_get_positions():
             print(f"[router] get_positions error for {brk}: {e}")
     return buckets
 
-@app.post("/close_position")
-def route_close_position(payload: Dict[str, Any] = Body(...)):
-    """
-    Close (square-off) the selected positions.
-    Payload: { "positions": [ { "name": "<client display name>", "symbol": "<symbol>" }, ... ] }
-    Returns: {"status":"completed","message":[...],"result":{"motilal":[...], "dhan":[...]}}
-    """
-    data = payload or {}
-    items: List[Dict[str, Any]] = data.get("positions") or []
-    if not items:
-        return {"status": "completed", "message": ["❌ No positions provided"], "result": {}}
-
-    # bucket by broker using your working helper
-    bucket: Dict[str, List[Dict[str, Any]]] = {"motilal": [], "dhan": []}
-    for it in items:
-        name = (it.get("name") or "").strip()
-        symbol = (it.get("symbol") or "").strip()
-        if not name or not symbol:
-            continue
-        brk = _broker_by_client_name(name)  # <- you already have this
-        if brk in bucket:
-            bucket[brk].append({"name": name, "symbol": symbol})
-
-    out_messages: List[str] = []
-    result: Dict[str, Any] = {}
-
-    # Motilal
-    if bucket["motilal"]:
-        try:
-            mo = importlib.import_module("Broker_motilal")
-            # returns List[str] (we wrote it that way)
-            msgs = mo.close_positions(bucket["motilal"])
-        except Exception as e:
-            msgs = [f"❌ Motilal: {e}"]
-        result["motilal"] = msgs
-        out_messages.extend(msgs)
-
-    # Dhan (optional, only if you implement close there)
-    if bucket["dhan"]:
-        try:
-            dn = importlib.import_module("Broker_dhan")
-            fn = getattr(dn, "close_positions", None)
-            if callable(fn):
-                msgs = fn(bucket["dhan"])
-            else:
-                msgs = ["❌ Dhan close not implemented"]
-        except Exception as e:
-            msgs = [f"❌ Dhan: {e}"]
-        result["dhan"] = msgs
-        out_messages.extend(msgs)
-
-    # Always return a friendly, stringy list so the UI can display it
-    return {"status": "completed", "message": out_messages, "result": result}
-
-
-# Optional alias if your UI hits /close_positions
 @app.post("/close_positions")
 def route_close_positions(payload: Dict[str, Any] = Body(...)):
-    return route_close_position(payload)
+    """payload: { positions: [{ name, symbol }, ...] }"""
+    items = payload.get("positions")
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="'positions' must be a list")
+
+    # bucket by broker using name
+    def _which_broker(name: str) -> str | None:
+        if not name:
+            return None
+        needle = str(name).strip().lower()
+        for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
+            try:
+                for fn in os.listdir(folder):
+                    if not fn.endswith(".json"): continue
+                    with open(os.path.join(folder, fn), "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if (d.get("name") or d.get("display_name") or "").strip().lower() == needle:
+                        return brk
+            except FileNotFoundError:
+                pass
+        return None
+
+    buckets = {"dhan": [], "motilal": []}
+    for it in items:
+        brk = _which_broker((it or {}).get("name"))
+        if brk in buckets:
+            buckets[brk].append(it)
+
+    messages: List[str] = []
+    for brk, rows in buckets.items():
+        if not rows: continue
+        try:
+            mod = importlib.import_module("Broker_dhan" if brk == "dhan" else "Broker_motilal")
+            fn  = getattr(mod, "close_positions", None)
+            res = fn(rows) if callable(fn) else None
+            if isinstance(res, list):
+                messages.extend([str(x) for x in res])
+            elif isinstance(res, dict):
+                msgs = res.get("message") or res.get("messages") or []
+                if isinstance(msgs, list): messages.extend([str(x) for x in msgs])
+        except Exception as e:
+            messages.append(f"❌ {brk} close_positions error: {e}")
+
+    return {"message": messages}
 @app.get("/get_holdings")
 def route_get_holdings():
     buckets = {"holdings": [], "summary": []}
@@ -1274,10 +1342,7 @@ def route_place_orders(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="Trigger price is required for SL/SL-M orders.")
 
     # ------------------- client index (userid -> broker/name/json) -------------------
-    BASE_DIR   = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
-    DHAN_DIR   = os.path.join(BASE_DIR, "clients", "dhan")
-    MO_DIR     = os.path.join(BASE_DIR, "clients", "motilal")
-    GROUPS_DIR = os.path.join(BASE_DIR, "groups")
+   
 
     def _index_clients() -> Dict[str, Dict[str, Any]]:
         idx: Dict[str, Dict[str, Any]] = {}
@@ -1422,7 +1487,7 @@ def route_place_orders(payload: Dict[str, Any] = Body(...)):
 
         for gsel in groups:
             gp = (globals().get("_find_group_path")(gsel)
-                  or os.path.join(GROUPS_DIR, f"{str(gsel).replace(' ', '_')}.json"))
+                  or os.path.join(GROUPS_ROOT, f"{str(gsel).replace(' ', '_')}.json"))
             if not gp or not os.path.exists(gp):
                 per_client_orders.append({"_skip": True, "reason": f"group_file_missing:{gsel}"})
                 continue
