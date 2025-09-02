@@ -81,7 +81,6 @@ def _read_json(path: str) -> Dict[str, Any]:
 # ---------- helpers ----------
 def _ensure_dirs():
     os.makedirs(os.path.dirname(SYMBOL_DB_PATH), exist_ok=True)
-
 def _github_sync_dir(rel_dir: str):
     if not (GITHUB_OWNER and GITHUB_REPO):
         return
@@ -98,6 +97,7 @@ def _github_sync_dir(rel_dir: str):
         if not name.lower().endswith(".json"):
             continue
 
+        # fetch file content
         dl = item.get("download_url")
         if not dl:
             # fallback via base64
@@ -116,6 +116,7 @@ def _github_sync_dir(rel_dir: str):
                 continue
             content = f2.text
 
+        # write locally
         local_path = os.path.join(BASE_DIR, rel_dir.replace("/", os.sep), name)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         try:
@@ -1688,5 +1689,4 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
-
 
