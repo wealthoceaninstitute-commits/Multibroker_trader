@@ -50,8 +50,15 @@ os.makedirs(MO_DIR,   exist_ok=True)
 app = FastAPI(title="Multi-broker Router")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://multibroker-trader.onrender.com"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=[
+        "https://multibrokertrader-production.up.railway.app",
+        "https://multibroker-trader.onrender.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
 
 # --- Groups storage (simple) ---
 GROUPS_ROOT = os.path.join(BASE_DIR, "groups")
