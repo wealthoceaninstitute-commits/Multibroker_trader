@@ -1,29 +1,37 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
-import { Button, Card, Table, Tabs, Tab, Badge, Modal, Form } from 'react-bootstrap';
+import { Button, Card, Table, Tabs, Tab, Badge, Modal, Form, Spinner } from 'react-bootstrap';
 import api from './api';
 
-const AUTO_REFRESH_MS = 3000; // adjust if you want (e.g., 5000)
+const AUTO_REFRESH_MS = 3000;
+
+const DISPLAY_TO_CANON = {
+  'NO_CHANGE': 'NO_CHANGE',
+  'LIMIT': 'LIMIT',
+  'MARKET': 'MARKET',
+  'STOPLOSS': 'STOPLOSS',
+  'SL MARKET': 'STOPLOSS_MARKET',
+};
 
 export default function Orders() {
   const [orders, setOrders] = useState({ pending: [], traded: [], rejected: [], cancelled: [], others: [] });
   const [selectedIds, setSelectedIds] = useState({});
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  // modify modal state
+  // modify modal
   const [showModify, setShowModify] = useState(false);
   const [modifyTarget, setModifyTarget] = useState(null); // {name, symbol, order_id}
   const [modQty, setModQty] = useState('');
   const [modPrice, setModPrice] = useState('');
   const [modTrig, setModTrig] = useState('');
-  const [modType, setModType] = useState('NO_CHANGE'); // LIMIT / MARKET / STOP_LOSS / STOP_LOSS_MARKET / NO_CHANGE
-  const [modLTP, setModLTP] = useState('—');           // read-only display
+  const [modType, setModType] = useState('NO_CHANGE'); // radios: LIMIT | MARKET | STOPLOSS | SL MARKET | NO_CHANGE
+  const [modLTP, setModLTP] = useState('—');
   const [modSaving, setModSaving] = useState(false);
 
-  const busyRef = useRef(false);      // pause polling while canceling/modifying
-  const snapRef = useRef('');         // last snapshot for change detection
+  const busyRef = useRef(false);
+  const snapRef = useRef('');
   const timerRef = useRef(null);
-  const abortRef = useRef(null);      // cancel in-flight refresh
+  const abortRef = useRef(null);
 
   const fetchAll = async () => {
     if (busyRef.current) return;
@@ -68,7 +76,7 @@ export default function Orders() {
 
   const toggle = (rowId) => setSelectedIds(prev => ({...prev, [rowId]: !prev[rowId]}));
 
-  // -------- Cancel --------
+  // ----- Cancel -----
   const cancelSelected = async () => {
     const rows = document.querySelectorAll('#pending_table tbody tr');
     const selectedOrders = [];
@@ -86,7 +94,7 @@ export default function Orders() {
     if (selectedOrders.length === 0) return alert('No orders selected.');
 
     try {
-      busyRef.current = true; // pause polling
+      busyRef.current = true;
       const res = await api.post('/cancel_order', { orders: selectedOrders });
       alert(Array.isArray(res.data?.message) ? res.data.message.join('\n') : 'Cancel request sent');
       setSelectedIds({});
@@ -98,23 +106,22 @@ export default function Orders() {
     }
   };
 
-  // -------- Modify (single pending order) --------
-  const requires = (type) => {
-    const t = String(type || '').toUpperCase();
+  // ----- Modify -----
+  const requires = (displayType) => {
+    const canon = DISPLAY_TO_CANON[displayType] || displayType;
     return {
-      price: t === 'LIMIT' || t === 'STOP_LOSS',
-      trig:  t === 'STOP_LOSS' || t === 'STOP_LOSS_MARKET',
+      price: ['LIMIT', 'STOPLOSS'].includes(canon),
+      trig:  ['STOPLOSS', 'STOPLOSS_MARKET'].includes(canon),
+      canon,
     };
   };
 
-  // optional LTP fetcher (safe no-op if API not present)
   const tryFetchLTP = async (symbol) => {
     try {
-      // If you expose this endpoint later, this will populate LTP; otherwise it stays "—"
-      const r = await api.get('/ltp', { params: { symbol } });
+      const r = await api.get('/ltp', { params: { symbol } }); // optional; ignore if not implemented
       const v = Number(r?.data?.ltp);
       if (!Number.isNaN(v)) setModLTP(v.toFixed(2));
-    } catch { /* ignore */ }
+    } catch {/* no-op */}
   };
 
   const openModify = () => {
@@ -138,8 +145,6 @@ export default function Orders() {
 
     const row = chosen[0];
     setModifyTarget({ name: row.name, symbol: row.symbol, order_id: row.order_id });
-
-    // Prefill with table price (if any); trigger left blank
     const p = parseFloat(row.price);
     setModPrice(!Number.isNaN(p) && p > 0 ? String(p) : '');
     setModTrig('');
@@ -147,7 +152,6 @@ export default function Orders() {
     setModType('NO_CHANGE');
     setModLTP('—');
     setShowModify(true);
-
     if (row.symbol) tryFetchLTP(row.symbol);
   };
 
@@ -155,7 +159,6 @@ export default function Orders() {
     if (!modifyTarget) return;
 
     const need = requires(modType);
-    // Parse numbers up-front (only if user typed anything)
     let qtyNum, priceNum, trigNum;
 
     if (modQty !== '') {
@@ -171,7 +174,7 @@ export default function Orders() {
       if (Number.isNaN(trigNum) || trigNum <= 0) return alert('Trigger price must be a positive number.');
     }
 
-    // Enforce required fields when an explicit order type is chosen
+    // Enforce requireds only when an explicit order type is chosen
     if (modType !== 'NO_CHANGE') {
       if (need.price && !(modPrice !== '' && priceNum > 0)) {
         return alert('Selected Order Type requires Price.');
@@ -181,19 +184,12 @@ export default function Orders() {
       }
     }
 
-    // Ensure at least one thing is changing
-    if (
-      modType === 'NO_CHANGE' &&
-      modQty === '' &&
-      modPrice === '' &&
-      modTrig === ''
-    ) {
+    if (modType === 'NO_CHANGE' && modQty === '' && modPrice === '' && modTrig === '') {
       return alert('Nothing to update. Change Qty / Price / Trigger Price / Order Type.');
     }
 
-    // Build payload (send only fields the user provided)
     const payload = { ...modifyTarget };
-    if (modType && modType !== 'NO_CHANGE') payload.ordertype = modType;
+    if (modType !== 'NO_CHANGE') payload.ordertype = need.canon; // map radios to canonical
     if (modQty !== '') payload.quantity = qtyNum;
     if (modPrice !== '') payload.price = priceNum;
     if (modTrig !== '') payload.triggerprice = trigNum;
@@ -203,7 +199,7 @@ export default function Orders() {
       setModSaving(true);
       const res = await api.post('/modify_order', { order: payload });
       const msg = res.data?.message || 'Modify request sent';
-      alert(Array.isArray(msg) ? res.data.message.join('\n') : msg);
+      alert(Array.isArray(msg) ? msg.join('\n') : msg);
       setShowModify(false);
       setSelectedIds({});
       await fetchAll();
@@ -218,19 +214,19 @@ export default function Orders() {
   const renderModifyModal = () => {
     const need = requires(modType);
     return (
-      <Modal show={showModify} onHide={() => setShowModify(false)} backdrop="static" centered>
+      <Modal show={showModify} onHide={() => setShowModify(false)} backdrop="static" centered contentClassName="blueTone modalCardPad">
         <Modal.Header closeButton>
           <Modal.Title>Modify Order</Modal.Title>
         </Modal.Header>
         <Modal.Body>
           {modifyTarget && (
             <>
-              <div className="mb-3 small">
+              <div className="small mb-2">
                 <div><strong>Symbol:</strong> {modifyTarget.symbol}</div>
                 <div><strong>Order ID:</strong> {modifyTarget.order_id}</div>
               </div>
 
-              {/* LTP (display only) */}
+              {/* LTP display */}
               <div className="mb-2">
                 <div className="text-uppercase text-muted" style={{fontSize:'0.75rem'}}>LTP</div>
                 <div style={{fontWeight:700, fontSize:'1.1rem'}}>{modLTP}</div>
@@ -245,8 +241,8 @@ export default function Orders() {
                 }}
               >
                 {/* Quantity */}
-                <Form.Group className="mb-3">
-                  <Form.Label>Quantity</Form.Label>
+                <Form.Group className="mb-2">
+                  <Form.Label className="label-tight">Quantity</Form.Label>
                   <Form.Control
                     type="number"
                     min="1"
@@ -258,8 +254,8 @@ export default function Orders() {
                 </Form.Group>
 
                 {/* Price */}
-                <Form.Group className="mb-3">
-                  <Form.Label>
+                <Form.Group className="mb-2">
+                  <Form.Label className="label-tight">
                     Price {modType !== 'NO_CHANGE' && need.price ? <span className="text-danger">*</span> : null}
                   </Form.Label>
                   <Form.Control
@@ -274,7 +270,7 @@ export default function Orders() {
 
                 {/* Trigger Price */}
                 <Form.Group className="mb-3">
-                  <Form.Label>
+                  <Form.Label className="label-tight">
                     Trig. Price {modType !== 'NO_CHANGE' && need.trig ? <span className="text-danger">*</span> : null}
                   </Form.Label>
                   <Form.Control
@@ -287,16 +283,22 @@ export default function Orders() {
                   />
                 </Form.Group>
 
-                {/* Order Type */}
+                {/* Order Type — radios like TradeForm */}
                 <Form.Group className="mb-1">
-                  <Form.Label>Order Type</Form.Label>
-                  <Form.Select value={modType} onChange={(e)=>setModType(e.target.value)}>
-                    <option value="NO_CHANGE">NO_CHANGE</option>
-                    <option value="LIMIT">LIMIT</option>
-                    <option value="MARKET">MARKET</option>
-                    <option value="STOPLOSS">STOPLOSS </option>
-                    <option value="SL_MARKET">SL_MARKET </option>
-                  </Form.Select>
+                  <Form.Label className="mb-1 fw-semibold">Order Type</Form.Label>
+                  <div className="d-flex align-items-center flex-wrap gap-3">
+                    {['NO_CHANGE','LIMIT','MARKET','STOPLOSS','SL MARKET'].map(ot => (
+                      <Form.Check
+                        key={ot}
+                        inline
+                        type="radio"
+                        name="modifyOrderType"
+                        label={ot.replace('SL MARKET','SL_MARKET')}
+                        checked={modType===ot}
+                        onChange={()=>setModType(ot)}
+                      />
+                    ))}
+                  </div>
                   <div className="form-text">
                     LIMIT → needs <strong>Price</strong>. SL-L → needs <strong>Price</strong> &amp; <strong>Trig</strong>. SL-M → needs <strong>Trig</strong>.
                     Keep default values &amp; change only what you need. Press <kbd>Enter</kbd> to submit.
@@ -306,12 +308,30 @@ export default function Orders() {
             </>
           )}
         </Modal.Body>
-        <Modal.Footer>
+        <Modal.Footer className="footerNudge">
           <Button variant="secondary" onClick={() => setShowModify(false)} disabled={modSaving}>Cancel</Button>
           <Button variant="warning" onClick={submitModify} disabled={modSaving}>
-            {modSaving ? 'Updating…' : 'Modify'}
+            {modSaving ? <Spinner size="sm" animation="border" className="me-2" /> : null}
+            Modify
           </Button>
         </Modal.Footer>
+
+        {/* modal-local styles to mirror TradeForm */}
+        <style jsx global>{`
+          .modalCardPad { padding: 0.5rem 1.25rem 0.75rem; }
+          @media (min-width: 992px) {
+            .modalCardPad { padding: 0.75rem 1.5rem 1rem; }
+          }
+          .blueTone {
+            background: linear-gradient(180deg, #f9fbff 0%, #f3f7ff 100%) !important;
+            border: 1px solid #d5e6ff !important;
+            box-shadow: 0 0 0 6px rgba(49, 132, 253, 0.12) !important;
+            border-radius: 10px !important;
+          }
+          .label-tight { margin-bottom: 4px; }
+          .footerNudge { padding-right: 1.25rem; } /* subtle right nudge like TradeForm */
+          input[type="radio"], input[type="checkbox"] { accent-color: #0d6efd; }
+        `}</style>
       </Modal>
     );
   };
