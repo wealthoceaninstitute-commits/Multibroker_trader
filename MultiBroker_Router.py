@@ -1687,180 +1687,175 @@ def route_place_orders(payload: Dict[str, Any] = Body(...)):
 def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
     return route_place_orders(payload)
 
-def modify_orders(orders, debug=False):
+@app.post("/modify_order")
+def route_modify_order(payload: Dict[str, Any] = Body(...)):
     """
-    Modify one or many DHAN orders and print the exact request body
-    we send to Dhan + the raw HTTP response.
-
-    Each item may include:
-      name, order_id, qty, price, triggerprice, ordertype, orderduration, disclosedquantity
+    Modify pending orders. Logs:
+      - incoming router payload
+      - per-broker payload we are about to send (esp. DHAN)
+    Accepts (typical):
+      {
+        "orders":[{name, order_id, ...}, ...],
+        "quantity": "",           # blank => keep same
+        "price": "",              # blank => keep same
+        "triggerprice": "",       # blank => keep same
+        "orderType": "LIMIT|MARKET|STOPLOSS|SL_MARKET|NO_CHANGE",
+        "validity": "DAY|IOC"
+      }
     """
-    import os, json, requests
+    import json
 
-    BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
-    DHAN_DIR = os.path.join(BASE_DIR, "clients", "dhan")
-    API_BASE = "https://api.dhan.co/v2"
+    # --- log raw inbound
+    try:
+        print("\n[/modify_order] INBOUND payload ↓")
+        print(json.dumps(payload, indent=2, default=str))
+    except Exception:
+        pass
 
-    def _mask_token(s: str) -> str:
-        s = (s or "")
-        if len(s) <= 8: return "*" * len(s)
-        return s[:4] + "*" * (len(s) - 7) + s[-3:]
+    orders = payload.get("orders") or []
+    if not isinstance(orders, list) or not orders:
+        raise HTTPException(status_code=400, detail="No orders provided.")
 
-    def _load_client_by_name(name: str):
+    # normalize fields
+    qty_in   = payload.get("quantity", "")
+    prc_in   = payload.get("price", "")
+    trg_in   = payload.get("triggerprice", payload.get("trig_price", ""))
+    ot_in    = (payload.get("orderType") or payload.get("ordertype") or "NO_CHANGE").upper().strip()
+    val_in   = (payload.get("validity") or payload.get("timeForce") or "DAY").upper().strip()
+
+    def _to_int_or_none(x):
+        try:
+            s = str(x).strip()
+            return None if s == "" else int(float(s))
+        except Exception:
+            return None
+
+    def _to_float_or_none(x):
+        try:
+            s = str(x).strip()
+            return None if s == "" else float(s)
+        except Exception:
+            return None
+
+    qty  = _to_int_or_none(qty_in)
+    prc  = _to_float_or_none(prc_in)
+    trig = _to_float_or_none(trg_in)
+
+    # Map UI -> DHAN orderType
+    def _map_to_dhan(ot: str) -> str | None:
+        m = {
+            "LIMIT": "LIMIT",
+            "MARKET": "MARKET",
+            "STOPLOSS": "STOPLOSS_LIMIT",      # SL-L
+            "SL_LIMIT": "STOPLOSS_LIMIT",
+            "SL-MARKET": "STOPLOSS_MARKET",
+            "SL_MARKET": "STOPLOSS_MARKET",
+            "STOPLOSS_MARKET": "STOPLOSS_MARKET",
+            "NO_CHANGE": None,                 # omit
+            "": None,
+        }
+        return m.get(ot.strip().upper(), None)
+
+    by_broker = {"dhan": [], "motilal": []}
+
+    # small helper: load client json by name
+    def _load_client_json(broker: str, name: str) -> Dict[str, Any] | None:
+        folder = DHAN_DIR if broker == "dhan" else MO_DIR
         needle = (name or "").strip().lower()
         try:
-            for fn in os.listdir(DHAN_DIR):
+            for fn in os.listdir(folder):
                 if not fn.endswith(".json"):
                     continue
-                with open(os.path.join(DHAN_DIR, fn), "r", encoding="utf-8") as f:
+                p = os.path.join(folder, fn)
+                with open(p, "r", encoding="utf-8") as f:
                     cj = json.load(f)
                 nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
                 if nm == needle:
                     return cj
         except FileNotFoundError:
-            pass
+            return None
         return None
 
-    def _to_float_or_none(v):
-        try:
-            if v is None: return None
-            s = str(v).strip()
-            if not s: return None
-            return float(s)
-        except Exception:
-            return None
-
-    def _to_int_or_none(v):
-        try:
-            if v is None: return None
-            s = str(v).strip()
-            if not s: return None
-            return int(float(s))
-        except Exception:
-            return None
-
-    OT_MAP = {
-        "LIMIT": "LIMIT",
-        "MARKET": "MARKET",
-        "STOPLOSS": "STOP_LOSS",
-        "STOP_LOSS": "STOP_LOSS",
-        "SL MARKET": "STOP_LOSS_MARKET",
-        "SL_MARKET": "STOP_LOSS_MARKET",
-        "STOP_LOSS_MARKET": "STOP_LOSS_MARKET",
-        "NO_CHANGE": None,
-        "": None,
-        None: None,
-    }
-
-    msgs = []
-    for it in (orders or []):
-        name = (it or {}).get("name") or ""
-        order_id = str((it or {}).get("order_id") or "").strip()
-        if not order_id:
-            msgs.append(f"❌ Modify failed for {name or 'unknown'}: missing order_id")
+    # bucket + build per-broker modify rows
+    for od in orders:
+        name = (od or {}).get("name", "")
+        oid  = (od or {}).get("order_id", "")
+        brk  = _guess_broker_from_order(od) or _broker_by_client_name(name)
+        if brk not in by_broker:
             continue
 
-        cj = _load_client_by_name(name)
-        if not cj:
-            msgs.append(f"❌ Modify failed for {name} ({order_id}): client not found")
-            continue
-
-        access_token = (cj.get("apikey") or "").strip()
-        dhan_client_id = (cj.get("userid") or "").strip()
-        if not access_token or not dhan_client_id:
-            msgs.append(f"❌ Modify failed for {name} ({order_id}): missing access-token / client id")
-            continue
-
-        # Build body: include only fields the caller wants to change
-        body = {
-            "dhanClientId": dhan_client_id,
-            "orderId": order_id,
+        row = {
+            "name": name,
+            "order_id": str(oid),
+            "validity": val_in or "DAY",
+            # only include fields user actually set:
+            **({ "quantity": qty } if qty is not None else {}),
+            **({ "price": prc } if prc is not None else {}),
+            **({ "triggerPrice": trig } if trig is not None else {}),
         }
 
-        qty = _to_int_or_none(it.get("qty") or it.get("quantity"))
-        if qty and qty > 0:
-            body["quantity"] = qty
+        if brk == "dhan":
+            mapped = _map_to_dhan(ot_in)
+            if mapped:
+                row["orderType"] = mapped
+            cj = _load_client_json("dhan", name) or {}
+            row["_client_json"] = cj  # pass through for token & client id
+            by_broker["dhan"].append(row)
+        else:
+            # For Motilal you can create the shape you need similarly.
+            by_broker["motilal"].append(row)
 
-        price = _to_float_or_none(it.get("price"))
-        if price is not None:
-            body["price"] = price
+    # --- log what we are about to send to each broker
+    try:
+        if by_broker["dhan"]:
+            print("\n[/modify_order] DHAN payload (to Broker_dhan.modify_orders) ↓")
+            print(json.dumps(by_broker["dhan"], indent=2, default=str))
+        if by_broker["motilal"]:
+            print("\n[/modify_order] MOTILAL payload (to Broker_motilal.modify_orders) ↓")
+            print(json.dumps(by_broker["motilal"], indent=2, default=str))
+    except Exception:
+        pass
 
-        trig = _to_float_or_none(it.get("triggerprice") or it.get("trig_price") or it.get("trigger_price"))
-        if trig is not None:
-            body["triggerPrice"] = trig
+    messages: list[str] = []
 
-        dq = _to_int_or_none(it.get("disclosedquantity") or it.get("disclosed_qty"))
-        if dq and dq > 0:
-            body["disclosedQuantity"] = dq
-
-        validity = (it.get("orderduration") or it.get("validity") or "").strip().upper()
-        if validity in ("DAY", "IOC"):
-            body["validity"] = validity
-
-        ot_raw = (it.get("ordertype") or "").strip().upper()
-        ot_map = OT_MAP.get(ot_raw, None)
-        if ot_map:
-            body["orderType"] = ot_map
-
-        # sanity checks for Dhan constraints
-        if body.get("orderType") in ("LIMIT", "STOP_LOSS") and ("price" not in body):
-            msgs.append(f"❌ Modify failed for {name} ({order_id}): Price required for {body['orderType']}")
-            continue
-        if body.get("orderType") in ("STOP_LOSS", "STOP_LOSS_MARKET") and ("triggerPrice" not in body):
-            msgs.append(f"❌ Modify failed for {name} ({order_id}): Trigger price required for {body['orderType']}")
-            continue
-
-        url = f"{API_BASE}/orders/{order_id}"
-        headers = {"Content-Type": "application/json", "access-token": access_token}
-
-        if debug:
-            print("\n[dhan][modify] >>> REQUEST")
-            print("[dhan][modify] url:", url)
-            print("[dhan][modify] headers:", {"Content-Type": "application/json",
-                                              "access-token": _mask_token(access_token)})
-            try:
-                print("[dhan][modify] body:", json.dumps(body, indent=2, ensure_ascii=False))
-            except Exception:
-                print("[dhan][modify] body: <unserializable>")
-
+    # ---- DHAN dispatch
+    if by_broker["dhan"]:
         try:
-            resp = requests.put(url, headers=headers, json=body, timeout=20)
-            try:
-                rj = resp.json()
-            except Exception:
-                rj = {"text": resp.text}
-
-            if debug:
-                print("[dhan][modify] <<< RESPONSE")
-                print("[dhan][modify] status:", resp.status_code)
-                try:
-                    print(json.dumps(rj, indent=2, ensure_ascii=False))
-                except Exception:
-                    print(rj)
-
-            ok = False
-            if isinstance(rj, dict):
-                status_val = str(rj.get("status") or rj.get("Status") or "").lower()
-                ok = (resp.status_code in (200, 201)) and (status_val == "success" or (not status_val and resp.ok))
-
-            if ok:
-                changed = [k for k in ("quantity", "price", "triggerPrice", "orderType", "validity", "disclosedQuantity") if k in body]
-                msgs.append(f"✅ Modified {name} ({order_id}): fields -> {', '.join(changed) if changed else 'none'}")
+            dh = importlib.import_module("Broker_dhan")
+            if hasattr(dh, "modify_orders") and callable(getattr(dh, "modify_orders")):
+                res = dh.modify_orders(by_broker["dhan"])
+                if isinstance(res, dict) and isinstance(res.get("message"), list):
+                    messages.extend([str(x) for x in res["message"]])
+                else:
+                    messages.append(str(res))
             else:
-                err = (rj.get("remarks") or rj.get("error") or rj.get("message") or rj)
-                msgs.append(f"❌ Modify failed for {name} ({order_id}): {err}")
+                messages.append("❌ Broker_dhan.modify_orders not implemented")
         except Exception as e:
-            msgs.append(f"❌ Modify failed for {name} ({order_id}): {e}")
+            messages.append(f"❌ dhan modify failed: {e}")
 
-    return msgs
+    # ---- Motilal dispatch (if you have it)
+    if by_broker["motilal"]:
+        try:
+            mo = importlib.import_module("Broker_motilal")
+            if hasattr(mo, "modify_orders") and callable(getattr(mo, "modify_orders")):
+                res = mo.modify_orders(by_broker["motilal"])
+                if isinstance(res, dict) and isinstance(res.get("message"), list):
+                    messages.extend([str(x) for x in res["message"]])
+                else:
+                    messages.append(str(res))
+            else:
+                messages.append("❌ Broker_motilal.modify_orders not implemented")
+        except Exception as e:
+            messages.append(f"❌ motilal modify failed: {e}")
 
-
+    return {"message": messages}
 
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
