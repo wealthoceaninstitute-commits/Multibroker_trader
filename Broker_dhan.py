@@ -695,19 +695,30 @@ def modify_order_dhan(
 
 
 # --- Optional: batch wrapper used by the router when available ---
-def modify_orders(orders: list[dict]) -> list[str]:
+def modify_orders(orders):
     """
-    Expected each order row to have:
-      { name, order_id, quantity?, price?, triggerprice?, ordertype?, validity?, disclosedquantity? }
-    Loads the Dhan client JSON by 'name' from ./data/clients/dhan and calls modify_order_dhan.
-    Returns a list of human-readable messages.
+    Modify one or many DHAN orders.
+    Expect each item like:
+      {
+        "name": "Edison wife",         # client display name (to find access-token & client id)
+        "order_id": "652509117977",   # required
+        "qty": 0|int,                  # optional; omit/0 to keep same
+        "price": 0|float|str,          # optional; LIMIT/SL needs price
+        "triggerprice": 0|float|str,   # optional; SL/SL-M needs trigger
+        "ordertype": "NO_CHANGE|LIMIT|MARKET|STOPLOSS|SL MARKET",  # optional
+        "orderduration": "DAY|IOC",    # optional; validity
+        "disclosedquantity": 0|int     # optional
+      }
+    Returns: list[str] messages (one per input row).
     """
-    import os, json
+    import os, json, requests
 
     BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
     DHAN_DIR = os.path.join(BASE_DIR, "clients", "dhan")
+    API_BASE = "https://api.dhan.co/v2"
 
-    def _load_client_by_name(name: str) -> dict | None:
+    def _load_client_by_name(name: str):
+        """Find dhan client json by display name (case-insensitive)."""
         needle = (name or "").strip().lower()
         try:
             for fn in os.listdir(DHAN_DIR):
@@ -722,33 +733,134 @@ def modify_orders(orders: list[dict]) -> list[str]:
             pass
         return None
 
-    msgs: list[str] = []
-    for od in orders or []:
-        name = od.get("name") or ""
-        oid  = od.get("order_id") or ""
-        cj   = _load_client_by_name(name)
-        if not cj:
-            msgs.append(f"❌ Dhan modify: client not found for {name}")
-            continue
-        if not oid:
-            msgs.append(f"❌ Dhan modify: missing order_id for {name}")
-            continue
+    def _to_float_or_none(v):
+        try:
+            if v is None: return None
+            s = str(v).strip()
+            if not s: return None
+            return float(s)
+        except Exception:
+            return None
 
-        res = modify_order_dhan(
-            cj, oid,
-            quantity      = od.get("quantity"),
-            price         = od.get("price"),
-            triggerprice  = od.get("triggerprice") or od.get("trigger_price"),
-            ordertype     = od.get("ordertype") or od.get("order_type"),
-            validity      = od.get("validity") or od.get("orderduration"),
-            disclosedqty  = od.get("disclosedquantity") or od.get("disclosed_qty"),
-        )
-        ok = isinstance(res, dict) and str(res.get("status", "")).lower() == "success"
-        if ok:
-            msgs.append(f"✅ Modified Order {oid} for {name}")
-        else:
-            err = (res.get("message") if isinstance(res, dict) else res)
-            msgs.append(f"❌ Modify failed for {name} ({oid}): {err}")
-    return msgs
+    def _to_int_or_none(v):
+        try:
+            if v is None: return None
+            s = str(v).strip()
+            if not s: return None
+            return int(float(s))
+        except Exception:
+            return None
+
+    # map UI terms -> Dhan API orderType
+    OT_MAP = {
+        "LIMIT": "LIMIT",
+        "MARKET": "MARKET",
+        "STOPLOSS": "STOP_LOSS",
+        "SL MARKET": "STOP_LOSS_MARKET",
+        "SL_MARKET": "STOP_LOSS_MARKET",
+        "STOP_LOSS": "STOP_LOSS",
+        "STOP_LOSS_MARKET": "STOP_LOSS_MARKET",
+        "NO_CHANGE": None,
+        "": None,
+        None: None,
+    }
+
+    messages = []
+    for it in (orders or []):
+        try:
+            name = (it or {}).get("name") or ""
+            order_id = str((it or {}).get("order_id") or "").strip()
+            if not order_id:
+                messages.append(f"❌ Modify failed for {name or 'unknown'}: missing order_id")
+                continue
+
+            cj = _load_client_by_name(name)
+            if not cj:
+                messages.append(f"❌ Modify failed for {name} ({order_id}): client not found")
+                continue
+
+            access_token = (cj.get("apikey") or "").strip()
+            dhan_client_id = (cj.get("userid") or "").strip()
+            if not access_token or not dhan_client_id:
+                messages.append(f"❌ Modify failed for {name} ({order_id}): missing access-token / client id")
+                continue
+
+            # Build request body – include ONLY fields that caller wants to change
+            body = {
+                "dhanClientId": dhan_client_id,
+                "orderId": order_id,
+            }
+
+            qty = _to_int_or_none(it.get("qty") or it.get("quantity"))
+            if qty and qty > 0:
+                body["quantity"] = qty
+
+            price = _to_float_or_none(it.get("price"))
+            if price is not None:
+                body["price"] = price
+
+            trig = _to_float_or_none(it.get("triggerprice") or it.get("trig_price") or it.get("trigger_price"))
+            if trig is not None:
+                body["triggerPrice"] = trig
+
+            dq = _to_int_or_none(it.get("disclosedquantity") or it.get("disclosed_qty"))
+            if dq and dq > 0:
+                body["disclosedQuantity"] = dq
+
+            validity = (it.get("orderduration") or it.get("validity") or "").strip().upper()
+            if validity in ("DAY", "IOC"):
+                body["validity"] = validity
+
+            ot_raw = (it.get("ordertype") or "").strip().upper()
+            ot_mapped = OT_MAP.get(ot_raw, None)
+            if ot_mapped:
+                body["orderType"] = ot_mapped
+
+            # Basic validations when orderType is being changed / enforced
+            if body.get("orderType") in ("LIMIT", "STOP_LOSS") and ("price" not in body or body["price"] is None):
+                messages.append(f"❌ Modify failed for {name} ({order_id}): Price required for {body['orderType']}")
+                continue
+            if body.get("orderType") in ("STOP_LOSS", "STOP_LOSS_MARKET") and ("triggerPrice" not in body or body["triggerPrice"] is None):
+                messages.append(f"❌ Modify failed for {name} ({order_id}): Trigger price required for {body['orderType']}")
+                continue
+
+            url = f"{API_BASE}/orders/{order_id}"
+            headers = {
+                "Content-Type": "application/json",
+                "access-token": access_token,
+            }
+            resp = requests.put(url, headers=headers, json=body, timeout=20)
+
+            # Parse response
+            try:
+                rj = resp.json()
+            except Exception:
+                rj = {"status_code": resp.status_code, "text": resp.text}
+
+            ok = False
+            # Dhan typically returns {"status":"success", ...} on success
+            if isinstance(rj, dict):
+                status_val = str(rj.get("status") or rj.get("Status") or "").lower()
+                ok = (resp.status_code in (200, 201)) and (status_val == "success" or not status_val and resp.ok)
+
+            if ok:
+                # summarize what changed
+                changed = []
+                for k_disp, k in (("Qty", "quantity"), ("Price", "price"), ("Trig", "triggerPrice"),
+                                  ("Type", "orderType"), ("Validity", "validity"), ("DiscQty", "disclosedQuantity")):
+                    if k in body:
+                        changed.append(f"{k_disp}={body[k]}")
+                ch_str = ", ".join(changed) if changed else "no fields"
+                messages.append(f"✅ Modified {name} ({order_id}): {ch_str}")
+            else:
+                err = (rj.get("remarks") or rj.get("error") or rj.get("message") or rj)
+                messages.append(f"❌ Modify failed for {name} ({order_id}): {err}")
+
+        except Exception as e:
+            messages.append(f"❌ Modify failed for {(it or {}).get('name') or 'unknown'} ({(it or {}).get('order_id') or ''}): {e}")
+
+    return messages
+
+
 
 
