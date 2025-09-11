@@ -10,11 +10,13 @@ export default function Orders() {
   const [selectedIds, setSelectedIds] = useState({});
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  // modify modal state
+  // modify modal state (no Price field)
   const [showModify, setShowModify] = useState(false);
   const [modifyTarget, setModifyTarget] = useState(null); // {name, symbol, order_id}
   const [modQty, setModQty] = useState('');
-  const [modPrice, setModPrice] = useState('');
+  const [modTrig, setModTrig] = useState('');
+  const [modType, setModType] = useState('NO_CHANGE'); // LIMIT / MARKET / STOP_LOSS / STOP_LOSS_MARKET / NO_CHANGE
+  const [modLTP, setModLTP] = useState('—');           // read-only display
   const [modSaving, setModSaving] = useState(false);
 
   const busyRef = useRef(false);      // pause polling while canceling/modifying
@@ -96,6 +98,16 @@ export default function Orders() {
   };
 
   // -------- Modify (single pending order) --------
+  // optional LTP fetcher (safe no-op if API not present)
+  const tryFetchLTP = async (symbol) => {
+    try {
+      // if you add an endpoint later, match it here; otherwise we keep '—'
+      const r = await api.get('/ltp', { params: { symbol } });
+      const v = Number(r?.data?.ltp);
+      if (!Number.isNaN(v)) setModLTP(v.toFixed(2));
+    } catch { /* ignore */ }
+  };
+
   const openModify = () => {
     const rows = document.querySelectorAll('#pending_table tbody tr');
     const chosen = [];
@@ -106,10 +118,6 @@ export default function Orders() {
         chosen.push({
           name: tds[1]?.textContent.trim(),
           symbol: tds[2]?.textContent.trim(),
-          type: tds[3]?.textContent.trim(),
-          quantity: tds[4]?.textContent.trim(),
-          price: tds[5]?.textContent.trim(),
-          status: tds[6]?.textContent.trim(),
           order_id: tds[7]?.textContent.trim(),
         });
       }
@@ -120,23 +128,36 @@ export default function Orders() {
 
     const row = chosen[0];
     setModifyTarget({ name: row.name, symbol: row.symbol, order_id: row.order_id });
-    setModQty(row.quantity && row.quantity !== 'N/A' ? String(row.quantity) : '');
-    setModPrice(row.price && row.price !== 'N/A' ? String(row.price) : '');
+    setModQty('');
+    setModTrig('');
+    setModType('NO_CHANGE');
+    setModLTP('—');
     setShowModify(true);
+    // non-blocking best-effort LTP
+    if (row.symbol) tryFetchLTP(row.symbol);
   };
 
   const submitModify = async () => {
     if (!modifyTarget) return;
 
-    // build payload with only provided fields
-    const payload = {
-      ...modifyTarget,
-      ...(modQty !== '' ? { quantity: Number(modQty) } : {}),
-      ...(modPrice !== '' ? { price: Number(modPrice) } : {}),
-    };
+    // Build payload with only provided fields (no price)
+    const payload = { ...modifyTarget };
+    if (modQty !== '') {
+      const q = parseInt(modQty, 10);
+      if (Number.isNaN(q) || q <= 0) return alert('Quantity must be a positive integer.');
+      payload.quantity = q;
+    }
+    if (modTrig !== '') {
+      const t = parseFloat(modTrig);
+      if (Number.isNaN(t) || t <= 0) return alert('Trigger price must be a positive number.');
+      payload.triggerprice = t;
+    }
+    if (modType && modType !== 'NO_CHANGE') {
+      payload.ordertype = modType; // LIMIT / MARKET / STOP_LOSS / STOP_LOSS_MARKET
+    }
 
-    if (!('quantity' in payload) && !('price' in payload)) {
-      return alert('Enter at least one field (Qty or Price) to modify.');
+    if (!('quantity' in payload) && !('triggerprice' in payload) && !('ordertype' in payload)) {
+      return alert('Nothing to update. Change Qty / Trigger Price / Order Type.');
     }
 
     try {
@@ -164,41 +185,73 @@ export default function Orders() {
       <Modal.Body>
         {modifyTarget && (
           <>
-            <div className="mb-3 small text-muted">
-              <strong>Name:</strong> {modifyTarget.name} &nbsp;|&nbsp; <strong>Symbol:</strong> {modifyTarget.symbol} &nbsp;|&nbsp; <strong>Order ID:</strong> {modifyTarget.order_id}
+            <div className="mb-3 small">
+              <div><strong>Symbol:</strong> {modifyTarget.symbol}</div>
+              <div><strong>Order ID:</strong> {modifyTarget.order_id}</div>
             </div>
-            <Form>
+
+            {/* LTP (display only) */}
+            <div className="mb-2">
+              <div className="text-uppercase text-muted" style={{fontSize:'0.75rem'}}>LTP</div>
+              <div style={{fontWeight:700, fontSize:'1.1rem'}}>{modLTP}</div>
+            </div>
+
+            <Form
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  submitModify();
+                }
+              }}
+            >
+              {/* Quantity */}
               <Form.Group className="mb-3">
-                <Form.Label>Quantity (leave blank to keep same)</Form.Label>
+                <Form.Label>Quantity</Form.Label>
                 <Form.Control
                   type="number"
                   min="1"
                   step="1"
                   value={modQty}
                   onChange={(e) => setModQty(e.target.value)}
-                  placeholder="e.g., 25"
+                  placeholder="Leave blank to keep same"
                 />
               </Form.Group>
-              <Form.Group className="mb-1">
-                <Form.Label>Price (leave blank to keep same)</Form.Label>
+
+              {/* Trigger Price */}
+              <Form.Group className="mb-3">
+                <Form.Label>Trig. Price</Form.Label>
                 <Form.Control
                   type="number"
-                  step="0.05"
                   min="0"
-                  value={modPrice}
-                  onChange={(e) => setModPrice(e.target.value)}
-                  placeholder="e.g., 102.5"
+                  step="0.05"
+                  value={modTrig}
+                  onChange={(e) => setModTrig(e.target.value)}
+                  placeholder="Leave blank to keep same"
                 />
-                <div className="form-text">If your broker requires LIMIT for price changes, make sure the price is valid for the instrument.</div>
+              </Form.Group>
+
+              {/* Order Type */}
+              <Form.Group className="mb-1">
+                <Form.Label>Order Type</Form.Label>
+                <Form.Select value={modType} onChange={(e)=>setModType(e.target.value)}>
+                  <option value="NO_CHANGE">NO_CHANGE</option>
+                  <option value="LIMIT">LIMIT</option>
+                  <option value="MARKET">MARKET</option>
+                  <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
+                  <option value="STOP_LOSS_MARKET">STOP_LOSS_MARKET (SL-M)</option>
+                </Form.Select>
+                <div className="form-text">
+                  Keep default values & change only what you need. Press <kbd>Enter</kbd> to submit.
+                </div>
               </Form.Group>
             </Form>
           </>
         )}
       </Modal.Body>
       <Modal.Footer>
-        <Button variant="secondary" onClick={() => setShowModify(false)} disabled={modSaving}>Close</Button>
+        <Button variant="secondary" onClick={() => setShowModify(false)} disabled={modSaving}>Cancel</Button>
         <Button variant="warning" onClick={submitModify} disabled={modSaving}>
-          {modSaving ? 'Updating…' : 'Update Order'}
+          {modSaving ? 'Updating…' : 'Modify'}
         </Button>
       </Modal.Footer>
     </Modal>
