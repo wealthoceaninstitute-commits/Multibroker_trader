@@ -1,14 +1,19 @@
-import os, json
-from typing import Dict, Any, List
+# Broker_dhan.py
+
+import os, json, threading
+from typing import Dict, Any, List, Optional
 import requests
-import threading
 
 STAT_KEYS = ["pending", "traded", "rejected", "cancelled", "others"]
 
 # use same DATA_DIR as router
-BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
+BASE_DIR    = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
 CLIENTS_DIR = os.path.join(BASE_DIR, "clients", "dhan")
 
+
+# ---------------------------
+# helpers
+# ---------------------------
 def _read_clients() -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     try:
@@ -24,6 +29,45 @@ def _read_clients() -> List[Dict[str, Any]]:
         pass
     return items
 
+def _norm_order_type(s: str) -> str:
+    """
+    Normalize UI/Router variants to Dhan API enums.
+    Dhan accepts: LIMIT, MARKET, STOP_LOSS, STOP_LOSS_MARKET
+    """
+    key = (s or "").strip().upper().replace("-", "_")
+    m = {
+        "LIMIT": "LIMIT",
+        "LMT": "LIMIT",
+        "MARKET": "MARKET",
+        "MKT": "MARKET",
+
+        "STOPLOSS": "STOP_LOSS",
+        "STOP_LOSS": "STOP_LOSS",
+        "STOP_LOSS_LIMIT": "STOP_LOSS",
+        "SL": "STOP_LOSS",
+        "SL_LIMIT": "STOP_LOSS",
+
+        "SLM": "STOP_LOSS_MARKET",
+        "SL_M": "STOP_LOSS_MARKET",
+        "SL_MARKET": "STOP_LOSS_MARKET",
+        "STOP_LOSS_MARKET": "STOP_LOSS_MARKET",
+    }
+    return m.get(key, key)
+
+def _needs_price(ot: str) -> bool:
+    ot = _norm_order_type(ot)
+    # LIMIT and STOP_LOSS (aka SL-limit) need price
+    return ot in ("LIMIT", "STOP_LOSS")
+
+def _needs_trigger(ot: str) -> bool:
+    ot = _norm_order_type(ot)
+    # both SL-limit and SL-market need trigger
+    return ot in ("STOP_LOSS", "STOP_LOSS_MARKET")
+
+
+# ---------------------------
+# session / info
+# ---------------------------
 def login(client: Dict[str, Any]) -> bool:
     token = (client.get("apikey") or client.get("access_token") or "").strip()
     if not token:
@@ -36,6 +80,7 @@ def login(client: Dict[str, Any]) -> bool:
     except Exception as e:
         print("[DHAN] login error:", e)
         return False
+
 
 def get_orders() -> Dict[str, List[Dict[str, Any]]]:
     buckets: Dict[str, List[Dict[str, Any]]] = {k: [] for k in STAT_KEYS}
@@ -77,19 +122,11 @@ def get_orders() -> Dict[str, List[Dict[str, Any]]]:
                 buckets["others"].append(row)
     return buckets
 
-# Broker_dhan.py
-import requests
-from typing import Any, Dict
 
+# ---------------------------
+# cancel single order (used by router fallback)
+# ---------------------------
 def cancel_order_dhan(client_json: Dict[str, Any], order_id: str) -> Dict[str, Any]:
-    """
-    Normalize Dhan cancel response so the router can keep using:
-        resp.get("status").lower() == "success"
-    Returns:
-      {"status":"success", "orderId":..., "orderStatus":..., "raw": {...}}
-      or
-      {"status":"error", "message":..., "raw": {...}}
-    """
     token = (client_json.get("apikey") or client_json.get("access_token") or "").strip()
     if not token:
         return {"status": "error", "message": "Missing access token", "raw": {}}
@@ -105,16 +142,15 @@ def cancel_order_dhan(client_json: Dict[str, Any], order_id: str) -> Dict[str, A
         except Exception:
             body = {}
 
-        # --- Normalize success ---
         status_l     = str(body.get("status") or "").strip().lower()
         order_status = str(body.get("orderStatus") or body.get("order_status") or "").strip().upper()
         msg_l        = str(body.get("message") or body.get("errorMessage") or "").strip().lower()
 
         ok = (
-            status_l == "success"                         # explicit success
-            or order_status.startswith("CANCEL")          # "CANCELLED", "CANCEL REQUEST SENT/RECEIVED", etc.
+            status_l == "success"
+            or order_status.startswith("CANCEL")
             or ("cancel" in msg_l and any(w in msg_l for w in ("sent", "received", "already", "placed")))
-            or (r.status_code in (200, 202, 204) and not body)  # some variants return 2xx with empty body
+            or (r.status_code in (200, 202, 204) and not body)
         )
 
         if ok:
@@ -125,7 +161,6 @@ def cancel_order_dhan(client_json: Dict[str, Any], order_id: str) -> Dict[str, A
                 "raw": body,
             }
 
-        # Not OK -> bubble up broker message
         return {
             "status": "error",
             "message": body.get("message") or body.get("errorMessage") or body or r.status_code,
@@ -135,8 +170,11 @@ def cancel_order_dhan(client_json: Dict[str, Any], order_id: str) -> Dict[str, A
     except Exception as e:
         return {"status": "error", "message": str(e), "raw": {}}
 
+
+# ---------------------------
+# positions / square-off
+# ---------------------------
 def get_positions() -> Dict[str, List[Dict[str, Any]]]:
-    """Return Dhan positions normalized into {open:[...], closed:[...]}"""
     positions_data: Dict[str, List[Dict[str, Any]]] = {"open": [], "closed": []}
 
     for c in _read_clients():
@@ -182,14 +220,7 @@ def get_positions() -> Dict[str, List[Dict[str, Any]]]:
     return positions_data
 
 
-
-
 def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
-    """
-    Close (square-off) positions for given [{name, symbol}] by placing
-    opposite MARKET orders using live position info.
-    """
-    # map: name -> client json
     by_name = {}
     for c in _read_clients():
         nm = (c.get("name") or c.get("display_name") or "").strip()
@@ -212,7 +243,7 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             messages.append(f"❌ Missing token/client for: {name}")
             continue
 
-        # fetch fresh positions to get netQty + securityId/etc
+        # fetch fresh positions
         try:
             p = requests.get(
                 "https://api.dhan.co/v2/positions",
@@ -253,12 +284,12 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
             "securityId": str(pos.get("securityId")),
             "quantity": int(qty),
             "disclosedQuantity": 0,
-            "price": "",
-            "triggerPrice": "",
+            "price": 0,
+            "triggerPrice": 0,
             "afterMarketOrder": False,
             "amoTime": "OPEN",
-            "boProfitValue": "",
-            "boStopLossValue": ""
+            "boProfitValue": 0,
+            "boStopLossValue": 0
         }
 
         try:
@@ -268,33 +299,25 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
                 json=payload,
                 timeout=10
             )
-            # be defensive: body can be {}, or error JSON, or normal order JSON
             try:
                 data = r.json() if r.content else {}
             except Exception:
                 data = {}
 
-            # --- normalize success ---
             order_id     = str(data.get("orderId") or "").strip()
             order_status = str(data.get("orderStatus") or data.get("status") or "").strip().upper()
             err_msg      = str(data.get("message") or data.get("errorMessage") or "").strip()
 
-            # Dhan typically returns 200 + {'orderId':..., 'orderStatus':'TRANSIT'} on success
             ok_http = r.status_code in (200, 202)
-            ok_body = (
-                bool(order_id) or
-                order_status in {"SUCCESS", "TRANSIT", "PENDING", "SENT", "RECEIVED", "PLACED", "OPEN"}
-            )
+            ok_body = (bool(order_id) or order_status in {"SUCCESS", "TRANSIT", "PENDING", "SENT", "RECEIVED", "PLACED", "OPEN"})
             ok = ok_http and ok_body
 
-            # craft a compact message like you saw in the UI
             if ok:
                 shown = {"orderId": order_id} if order_id else {}
                 if order_status:
                     shown["orderStatus"] = order_status
                 messages.append(f"✅ {name} - close {symbol}: {shown or 'OK'}")
             else:
-                # show any server-provided error details
                 detail = err_msg or (data if data else f"HTTP {r.status_code}")
                 messages.append(f"❌ {name} - close {symbol}: {detail}")
 
@@ -303,23 +326,11 @@ def close_positions(positions: List[Dict[str, Any]]) -> List[str]:
 
     return messages
 
+
+# ---------------------------
+# holdings + funds
+# ---------------------------
 def get_holdings() -> Dict[str, Any]:
-    """
-    Dhan holdings using LTP present in /v2/holdings and cash from /v2/fundlimit.
-    Returns: {"holdings": [...], "summary": [...]}
-
-    holdings rows:
-      {name, symbol, quantity, buy_avg, ltp, pnl}
-
-    summary rows (per client):
-      {
-        name, capital, invested, pnl, current_value,
-        available_margin, net_gain,
-        available_balance, withdrawable_balance,
-        utilized_amount, sod_limit, collateral_amount,
-        receivable_amount, blocked_payout_amount
-      }
-    """
     holdings_rows: List[Dict[str, Any]] = []
     summaries: List[Dict[str, Any]] = []
 
@@ -327,7 +338,6 @@ def get_holdings() -> Dict[str, Any]:
         name       = c.get("name") or c.get("display_name") or c.get("userid") or c.get("client_id") or ""
         access_tok = (c.get("apikey") or c.get("access_token") or "").strip()
 
-        # capital from client file (fallback 0.0)
         try:
             capital = float(c.get("capital", 0) or c.get("base_amount", 0) or 0.0)
         except Exception:
@@ -336,7 +346,7 @@ def get_holdings() -> Dict[str, Any]:
         if not access_tok:
             continue
 
-        # --- 1) HOLDINGS (ltp is already included) ---
+        # 1) holdings
         try:
             resp = requests.get(
                 "https://api.dhan.co/v2/holdings",
@@ -358,7 +368,6 @@ def get_holdings() -> Dict[str, Any]:
             try:
                 qty    = float(h.get("availableQty", h.get("totalQty", 0)) or 0)
                 buyavg = float(h.get("avgCostPrice", 0) or 0)
-                # LTP key variants seen in raw payload
                 ltp    = float(h.get("lastTradedPrice", h.get("LTP", h.get("ltp", h.get("lastprice", 0)))) or 0)
             except Exception:
                 qty, buyavg, ltp = 0.0, 0.0, 0.0
@@ -381,7 +390,7 @@ def get_holdings() -> Dict[str, Any]:
 
         current_value = invested + total_pnl
 
-        # --- 2) FUNDS (/v2/fundlimit) ---
+        # 2) funds
         funds = {}
         try:
             f = requests.get(
@@ -394,7 +403,6 @@ def get_holdings() -> Dict[str, Any]:
         except Exception as e:
             print(f"[DHAN] fundlimit error for {name}: {e}")
 
-        # Dhan responses sometimes have a typo "availabelBalance"; handle both.
         available_balance     = float(funds.get("availabelBalance", funds.get("availableBalance", 0)) or 0)
         withdrawable_balance  = float(funds.get("withdrawableBalance", 0) or 0)
         utilized_amount       = float(funds.get("utilizedAmount", 0) or 0)
@@ -403,9 +411,7 @@ def get_holdings() -> Dict[str, Any]:
         receivable_amount     = float(funds.get("receivableAmount", funds.get("receiveableAmount", 0)) or 0)
         blocked_payout_amount = float(funds.get("blockedPayoutAmount", 0) or 0)
 
-        # For backward compatibility with your UI field name
         available_margin = available_balance
-
         net_gain = round((current_value + available_margin) - capital, 2)
 
         summaries.append({
@@ -414,11 +420,8 @@ def get_holdings() -> Dict[str, Any]:
             "invested": round(invested, 2),
             "pnl": round(total_pnl, 2),
             "current_value": round(current_value, 2),
-
-            # existing field used by your UI
             "available_margin": round(available_margin, 2),
 
-            # additional fund fields for completeness
             "available_balance": round(available_balance, 2),
             "withdrawable_balance": round(withdrawable_balance, 2),
             "utilized_amount": round(utilized_amount, 2),
@@ -432,13 +435,17 @@ def get_holdings() -> Dict[str, Any]:
 
     return {"holdings": holdings_rows, "summary": summaries}
 
+
+# ---------------------------
+# place orders (fixed)
+# ---------------------------
 def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Place a batch of orders on Dhan.
     Input  : list of normalized items from the router; each item should include:
              client_id, action, ordertype, producttype, orderduration, exchange,
              qty, price, triggerprice, disclosedquantity, amoorder, correlation_id,
-             security_id (Dhan), symboltoken (optional, ignored), tag, symbol (label)
+             security_id (Dhan), symboltoken (ignored), tag, symbol (label)
     Output : {"status": "completed", "order_responses": { "<tag:client>": <dhan json> , ...}}
     """
     if not isinstance(orders, list) or not orders:
@@ -456,6 +463,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         "NSE": "NSE_EQ",
         "BSE": "BSE_EQ",
         "NSEFO": "NSE_FNO",
+        "NSE_FO": "NSE_FNO",
         "NSECD": "NSE_CURRENCY",
         "MCX": "MCX_COMM",
         "BSEFO": "BSE_FNO",
@@ -469,7 +477,7 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         "CNC": "CNC",
         "NORMAL": "MARGIN",
         "NRML": "MARGIN",
-        "VALUEPLUS": "INTRADAY",  # <-- important for your UI
+        "VALUEPLUS": "INTRADAY",
         "MTF": "MTF",
     }
 
@@ -497,49 +505,55 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # Gather/normalize fields
         exchange   = (od.get("exchange") or "NSE").upper()
-        ordertype  = (od.get("ordertype") or "").upper()
+        ordertype  = _norm_order_type(od.get("ordertype") or "")
         product_in = (od.get("producttype") or "").upper()
         validity   = (od.get("orderduration") or "DAY").upper()
 
-        security_id = str(od.get("security_id") or "").strip()  # MUST be present for Dhan
+        security_id = str(od.get("security_id") or "").strip()  # REQUIRED
         qty         = int(od.get("qty") or 0)
-        price       = float(od.get("price") or 0)
-        trig        = float(od.get("triggerprice") or 0)
+        try:
+            price = float(od.get("price") or 0)
+        except Exception:
+            price = 0.0
+        try:
+            trig = float(od.get("triggerprice") or 0)
+        except Exception:
+            trig = 0.0
         disc_qty    = int(od.get("disclosedquantity") or 0)
         is_amo      = (od.get("amoorder") or "N") == "Y"
         corr_id     = od.get("correlation_id") or f"ROUTER{uid[-4:].zfill(4)}"
 
-        # Basic validations to avoid DH-905
+        # Validations to prevent DH-905
         if not security_id:
             with lock:
                 responses[key] = {"status": "ERROR", "message": "Missing securityId for Dhan"}
             return
-        if ordertype == "LIMIT" and price <= 0:
+        if _needs_price(ordertype) and price <= 0:
             with lock:
-                responses[key] = {"status": "ERROR", "message": "LIMIT order requires price > 0"}
+                responses[key] = {"status": "ERROR", "message": "Order requires price > 0"}
             return
-        if ("SL" in ordertype) and trig <= 0:
+        if _needs_trigger(ordertype) and trig <= 0:
             with lock:
-                responses[key] = {"status": "ERROR", "message": "SL/SL-M order requires triggerPrice > 0"}
+                responses[key] = {"status": "ERROR", "message": "Order requires triggerPrice > 0"}
             return
 
-        data = {
+        data: Dict[str, Any] = {
             "dhanClientId": uid,
             "correlationId": corr_id,
             "transactionType": (od.get("action") or "").upper(),
             "exchangeSegment": EXCHANGE_MAP.get(exchange, exchange),
             "productType": PRODUCT_MAP.get(product_in, product_in),
-            "orderType": ordertype,
+            "orderType": ordertype,                # already normalized
             "validity": validity,
             "securityId": security_id,
             "quantity": qty,
-            "disclosedQuantity": disc_qty if disc_qty else "",
-            "price": price if ordertype == "LIMIT" else "",
-            "triggerPrice": trig if ("SL" in ordertype) else "",
+            "disclosedQuantity": disc_qty,         # always numeric
+            "price": price if _needs_price(ordertype) else 0,
+            "triggerPrice": trig if _needs_trigger(ordertype) else 0,
             "afterMarketOrder": is_amo,
             "amoTime": "OPEN",
-            "boProfitValue": "",
-            "boStopLossValue": "",
+            "boProfitValue": 0,
+            "boStopLossValue": 0,
         }
 
         # --- DEBUG: print final payload & response ---
@@ -584,6 +598,3 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
-
-
-
