@@ -1682,215 +1682,78 @@ def route_place_orders(payload: Dict[str, Any] = Body(...)):
 
     return {"status": "completed", "result": results}
 
-
-@app.post("/modify_order")
-def route_modify_order(payload: Dict[str, Any] = Body(...)):
-    """
-    Modify one or many orders, grouped by broker (like /cancel_order).
-
-    Accepts either:
-      { order: { name, order_id, quantity?, price?, triggerprice?, ordertype? } }
-      { orders: [ { name, order_id, ... }, ... ] }
-
-    ordertype (case-insensitive) may be: NO_CHANGE | LIMIT | MARKET | STOPLOSS | SL MARKET | SL-M | STOPLOSS_MARKET
-    """
-    import importlib, json, os
-
-    # ---- normalize input to a list
-    items = []
-    if isinstance(payload.get("order"), dict):
-        items = [payload["order"]]
-    elif isinstance(payload.get("orders"), list):
-        items = payload["orders"]
-    else:
-        raise HTTPException(status_code=400, detail="❌ Provide 'order' or 'orders'.")
-
-    # ---- helpers
-    def _canon_ordertype(v: Optional[str]) -> Optional[str]:
-        if not v:
-            return None
-        s = str(v).strip().upper().replace("_", " ")
-        if s in ("NO CHANGE", "NO_CHANGE", "NONE"):
-            return None
-        if s in ("SL-M", "SL M", "SL MARKET", "STOPLOSS MARKET", "STOP LOSS MARKET"):
-            return "STOPLOSS_MARKET"
-        if s in ("SL", "STOPLOSS", "STOP LOSS", "STOPLOSS LIMIT"):
-            return "STOPLOSS"
-        if s in ("LIMIT",):
-            return "LIMIT"
-        if s in ("MARKET",):
-            return "MARKET"
-        # unknown -> passthrough
-        return s.replace(" ", "_")
-
-    def _needs(ot: Optional[str]) -> Dict[str, bool]:
-        if not ot:
-            return {"price": False, "trig": False}
-        ot = ot.upper()
-        return {
-            "price": ot in ("LIMIT", "STOPLOSS"),
-            "trig":  ot in ("STOPLOSS", "STOPLOSS_MARKET"),
-        }
-
-    def _load_client_json(broker: str, name: str) -> Optional[Dict[str, Any]]:
-        needle = (name or "").strip().lower()
-        folder = DHAN_DIR if broker == "dhan" else MO_DIR
-        try:
-            for fn in os.listdir(folder):
-                if not fn.endswith(".json"):
-                    continue
-                path = os.path.join(folder, fn)
-                with open(path, "r", encoding="utf-8") as f:
-                    cj = json.load(f)
-                nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
-                if nm == needle:
-                    return cj
-        except FileNotFoundError:
-            pass
-        return None
-
-    # ---- bucket per broker & validate
-    by_broker: Dict[str, List[Dict[str, Any]]] = {"dhan": [], "motilal": []}
-    messages: List[str] = []
-    unknown: List[str]  = []
-
-    for raw in items:
-        od = dict(raw or {})
-        name = str(od.get("name") or "").strip()
-        oid  = str(od.get("order_id") or "").strip()
-        if not name or not oid:
-            messages.append(f"❌ Missing name/order_id in {raw}")
-            continue
-
-        ot = _canon_ordertype(od.get("ordertype") or od.get("order_type"))
-        need = _needs(ot)
-
-        # pull numbers if present
-        q  = od.get("quantity")
-        pr = od.get("price")
-        tg = od.get("triggerprice") if "triggerprice" in od else od.get("trigger_price")
-
-        # Validate required fields when ordertype specified
-        if ot and need["price"] and (pr is None or float(str(pr) or 0) <= 0):
-            messages.append(f"❌ {name}/{oid}: Price required for {ot}.")
-            continue
-        if ot and need["trig"] and (tg is None or float(str(tg) or 0) <= 0):
-            messages.append(f"❌ {name}/{oid}: Trigger Price required for {ot}.")
-            continue
-
-        # normalized order dict passed to broker modules
-        norm = {
-            "name": name,
-            "order_id": oid,
-        }
-        if q is not None:
-            try: norm["quantity"] = int(float(q))
-            except Exception: pass
-        if pr is not None:
-            try: norm["price"] = float(pr)
-            except Exception: pass
-        if tg is not None:
-            try:
-                norm["triggerprice"] = float(tg)
-                norm["trigger_price"] = float(tg)  # offer both spellings
-            except Exception:
-                pass
-        if ot:
-            norm["ordertype"]  = ot
-            norm["order_type"] = ot  # alternate key for modules
-
-        brk = _guess_broker_from_order(od) or _broker_by_client_name(name)
-        if brk in by_broker:
-            by_broker[brk].append(norm)
-        else:
-            unknown.append(name)
-
-    # ---- DHAN
-    if by_broker["dhan"]:
-        try:
-            dh = importlib.import_module("Broker_dhan")
-            if hasattr(dh, "modify_orders") and callable(getattr(dh, "modify_orders")):
-                res = dh.modify_orders(by_broker["dhan"])
-                if isinstance(res, list):
-                    messages.extend([str(x) for x in res])
-                elif isinstance(res, dict) and isinstance(res.get("message"), list):
-                    messages.extend([str(x) for x in res["message"]])
-                else:
-                    messages.append(str(res))
-            else:
-                for od in by_broker["dhan"]:
-                    cj = _load_client_json("dhan", od["name"])
-                    if not cj:
-                        messages.append(f"❌ dhan modify: client JSON not found for {od['name']}")
-                        continue
-                    # Flexible fallbacks
-                    try:
-                        if hasattr(dh, "modify_order_dhan"):
-                            r = dh.modify_order_dhan(
-                                cj, od["order_id"],
-                                quantity=od.get("quantity"),
-                                price=od.get("price"),
-                                triggerprice=od.get("triggerprice") or od.get("trigger_price"),
-                                ordertype=od.get("ordertype") or od.get("order_type"),
-                            )
-                        elif hasattr(dh, "modify_order"):
-                            r = dh.modify_order({**od, "client": cj})
-                        else:
-                            r = "❌ dhan modify: no suitable function exported"
-                        if isinstance(r, dict) and str(r.get("status", "")).lower() == "success":
-                            messages.append(f"✅ Modified {od['order_id']} for {od['name']}")
-                        else:
-                            err = r.get("message") if isinstance(r, dict) else r
-                            messages.append(f"❌ Modify failed ({od['name']}): {err}")
-                    except Exception as e:
-                        messages.append(f"❌ dhan modify error ({od['name']}): {e}")
-        except Exception as e:
-            messages.append(f"❌ dhan modify failed: {e}")
-
-    # ---- MOTILAL
-    if by_broker["motilal"]:
-        try:
-            mo = importlib.import_module("Broker_motilal")
-            if hasattr(mo, "modify_orders") and callable(getattr(mo, "modify_orders")):
-                res = mo.modify_orders(by_broker["motilal"])
-                if isinstance(res, list):
-                    messages.extend([str(x) for x in res])
-                elif isinstance(res, dict) and isinstance(res.get("message"), list):
-                    messages.extend([str(x) for x in res["message"]])
-                else:
-                    messages.append(str(res))
-            else:
-                for od in by_broker["motilal"]:
-                    try:
-                        if hasattr(mo, "modify_order"):
-                            r = mo.modify_order(od)
-                        else:
-                            r = "❌ motilal modify: no suitable function exported"
-                        if isinstance(r, dict) and isinstance(r.get("message"), list):
-                            messages.extend([str(x) for x in r["message"]])
-                        else:
-                            messages.append(str(r))
-                    except Exception as e:
-                        messages.append(f"❌ motilal modify error ({od['name']}): {e}")
-        except Exception as e:
-            messages.append(f"❌ motilal modify failed: {e}")
-
-    if unknown:
-        messages.append("ℹ️ Unknown broker for: " + ", ".join(sorted(set(unknown))))
-
-    if not by_broker["dhan"] and not by_broker["motilal"]:
-        return {"message": messages or ["No matching broker for the selected orders."]}
-
-    return {"message": messages}
-
-
-
-
-
 # Backward-compatibility for UIs posting to /place_order
 @app.post("/place_order")
 def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
     return route_place_orders(payload)
+
+@app.post("/modify_orders")
+def route_modify_orders(payload: Dict[str, Any] = Body(...)):
+    """
+    Debug-friendly order modification router.
+    Prints the incoming payload and the per-broker payloads it forwards.
+    """
+    import json, importlib, os
+
+    DEBUG = str(os.getenv("DEBUG_MODIFY", "1")).lower() not in ("0", "false", "no")
+
+    if DEBUG:
+        try:
+            print("[router][modify] incoming payload:")
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        except Exception:
+            print("[router][modify] incoming payload: <unserializable>")
+
+    orders = payload.get("orders") or []
+    if not isinstance(orders, list) or not orders:
+        raise HTTPException(status_code=400, detail="❌ No orders received for modification.")
+
+    # bucket by broker (use order_id shape first, then fallback to name)
+    by_broker: Dict[str, List[Dict[str, Any]]] = {"dhan": [], "motilal": []}
+    unknown: List[Dict[str, Any]] = []
+    for od in orders:
+        brk = _guess_broker_from_order(od) or _broker_by_client_name((od or {}).get("name"))
+        if brk in by_broker:
+            by_broker[brk].append(od)
+        else:
+            unknown.append(od)
+
+    if DEBUG and by_broker["dhan"]:
+        print("[router][modify] -> DHAN payload:")
+        print(json.dumps(by_broker["dhan"], indent=2, ensure_ascii=False))
+    if DEBUG and by_broker["motilal"]:
+        print("[router][modify] -> MOTILAL payload:")
+        print(json.dumps(by_broker["motilal"], indent=2, ensure_ascii=False))
+
+    messages: List[str] = []
+
+    # DHAN
+    if by_broker["dhan"]:
+        try:
+            dh = importlib.import_module("Broker_dhan")
+            res = dh.modify_orders(by_broker["dhan"], debug=DEBUG)  # <-- pass debug flag
+            if isinstance(res, list): messages.extend([str(x) for x in res])
+            else: messages.append(str(res))
+        except Exception as e:
+            messages.append(f"❌ dhan modify failed: {e}")
+
+    # MOTILAL (call only if you have it wired)
+    if by_broker["motilal"]:
+        try:
+            mo = importlib.import_module("Broker_motilal")
+            if hasattr(mo, "modify_orders"):
+                res = mo.modify_orders(by_broker["motilal"])
+                if isinstance(res, list): messages.extend([str(x) for x in res])
+                else: messages.append(str(res))
+            else:
+                messages.append("ℹ️ motilal modify_orders not implemented")
+        except Exception as e:
+            messages.append(f"❌ motilal modify failed: {e}")
+
+    if unknown:
+        messages.append("ℹ️ Unknown broker for some selected orders.")
+
+    return {"message": messages}
 
 
 
@@ -1898,5 +1761,6 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
