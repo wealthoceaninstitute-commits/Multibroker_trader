@@ -598,3 +598,157 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         t.join()
 
     return {"status": "completed", "order_responses": responses}
+
+# --- Dhan: single-order modify helper (PUT /v2/orders/{orderId}) ---
+def modify_order_dhan(
+    client: dict,
+    order_id: str,
+    quantity: int | None = None,
+    price: float | None = None,
+    triggerprice: float | None = None,
+    ordertype: str | None = None,   # LIMIT | MARKET | STOPLOSS | STOPLOSS_MARKET | SL | SL-M | ...
+    validity: str | None = None,    # DAY | IOC
+    disclosedqty: int | None = None,
+    leg_name: str = ""              # optional, keep empty for regular orders
+) -> dict:
+    """
+    Calls Dhan v2 'Order Modification' API.
+    Requires client to contain:
+      client['userid'] -> dhanClientId
+      client['apikey'] -> access-token (JWT)
+    """
+    import requests, json
+
+    def _map_ot(ot: str | None) -> str | None:
+        if not ot:
+            return None
+        s = str(ot).strip().upper().replace("_", " ")
+        if s in ("SL-M", "SL M", "SL MARKET", "STOPLOSS MARKET", "STOP LOSS MARKET"):
+            return "STOP LOSS MARKET"
+        if s in ("SL", "STOPLOSS", "STOP LOSS", "STOP LOSS LIMIT"):
+            return "STOP LOSS"
+        if s in ("LIMIT", "MARKET"):
+            return s
+        return s  # passthrough
+
+    dhan_client_id = str(client.get("userid") or client.get("client_id") or "").strip()
+    token = (client.get("apikey") or "").strip()
+    if not dhan_client_id or not token:
+        return {"status": "error", "message": "Missing dhanClientId or access token in client JSON."}
+    if not str(order_id).strip():
+        return {"status": "error", "message": "order_id is required"}
+
+    ot = _map_ot(ordertype)
+
+    # Validation according to Dhan semantics
+    if ot == "LIMIT" and (price is None or float(price) <= 0):
+        return {"status": "error", "message": "Price must be > 0 for LIMIT orders."}
+    if ot == "STOP LOSS" and (price is None or float(price) <= 0 or triggerprice is None or float(triggerprice) <= 0):
+        return {"status": "error", "message": "Both price and triggerPrice are required for STOP LOSS orders."}
+    if ot == "STOP LOSS MARKET" and (triggerprice is None or float(triggerprice) <= 0):
+        return {"status": "error", "message": "triggerPrice is required for STOP LOSS MARKET orders."}
+    if quantity is not None and int(quantity) <= 0:
+        return {"status": "error", "message": "Quantity must be a positive integer."}
+
+    # Build request payload — only include fields that are actually being changed
+    payload: dict = {
+        "dhanClientId": dhan_client_id,
+        "orderId": str(order_id),
+    }
+    if ot:                   payload["orderType"]         = ot
+    if leg_name is not None: payload["legName"]           = leg_name
+    if quantity is not None: payload["quantity"]          = str(int(quantity))
+    if price is not None:    payload["price"]             = str(float(price))
+    if disclosedqty is not None:
+                             payload["disclosedQuantity"] = str(int(disclosedqty))
+    if triggerprice is not None:
+                             payload["triggerPrice"]      = str(float(triggerprice))
+    if validity:             payload["validity"]          = str(validity).upper()
+
+    url = f"https://api.dhan.co/v2/orders/{order_id}"
+    headers = {
+        "Content-Type": "application/json",
+        "access-token": token,  # Dhan JWT
+    }
+
+    try:
+        resp = requests.put(url, headers=headers, json=payload, timeout=20)
+        # Dhan returns JSON with status/message; propagate along with HTTP code
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text}
+        if 200 <= resp.status_code < 300:
+            # normalize success shape
+            if isinstance(body, dict):
+                body.setdefault("http_status", resp.status_code)
+                body.setdefault("status", body.get("status") or "success")
+            return body
+        return {
+            "status": "error",
+            "http_status": resp.status_code,
+            "message": (body.get("message") if isinstance(body, dict) else body),
+            "response": body,
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Dhan modify call failed: {e}"}
+
+
+# --- Optional: batch wrapper used by the router when available ---
+def modify_orders(orders: list[dict]) -> list[str]:
+    """
+    Expected each order row to have:
+      { name, order_id, quantity?, price?, triggerprice?, ordertype?, validity?, disclosedquantity? }
+    Loads the Dhan client JSON by 'name' from ./data/clients/dhan and calls modify_order_dhan.
+    Returns a list of human-readable messages.
+    """
+    import os, json
+
+    BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
+    DHAN_DIR = os.path.join(BASE_DIR, "clients", "dhan")
+
+    def _load_client_by_name(name: str) -> dict | None:
+        needle = (name or "").strip().lower()
+        try:
+            for fn in os.listdir(DHAN_DIR):
+                if not fn.endswith(".json"):
+                    continue
+                with open(os.path.join(DHAN_DIR, fn), "r", encoding="utf-8") as f:
+                    cj = json.load(f)
+                nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
+                if nm == needle:
+                    return cj
+        except FileNotFoundError:
+            pass
+        return None
+
+    msgs: list[str] = []
+    for od in orders or []:
+        name = od.get("name") or ""
+        oid  = od.get("order_id") or ""
+        cj   = _load_client_by_name(name)
+        if not cj:
+            msgs.append(f"❌ Dhan modify: client not found for {name}")
+            continue
+        if not oid:
+            msgs.append(f"❌ Dhan modify: missing order_id for {name}")
+            continue
+
+        res = modify_order_dhan(
+            cj, oid,
+            quantity      = od.get("quantity"),
+            price         = od.get("price"),
+            triggerprice  = od.get("triggerprice") or od.get("trigger_price"),
+            ordertype     = od.get("ordertype") or od.get("order_type"),
+            validity      = od.get("validity") or od.get("orderduration"),
+            disclosedqty  = od.get("disclosedquantity") or od.get("disclosed_qty"),
+        )
+        ok = isinstance(res, dict) and str(res.get("status", "")).lower() == "success"
+        if ok:
+            msgs.append(f"✅ Modified Order {oid} for {name}")
+        else:
+            err = (res.get("message") if isinstance(res, dict) else res)
+            msgs.append(f"❌ Modify failed for {name} ({oid}): {err}")
+    return msgs
+
+
