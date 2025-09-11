@@ -294,8 +294,8 @@ export default function Orders() {
                     <option value="NO_CHANGE">NO_CHANGE</option>
                     <option value="LIMIT">LIMIT</option>
                     <option value="MARKET">MARKET</option>
-                    <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
-                    <option value="STOP_LOSS_MARKET">STOP_LOSS_MARKET (SL-M)</option>
+                    <option value="STOPLOSS">STOPLOSS </option>
+                    <option value="SL_MARKET">SL_MARKET </option>
                   </Form.Select>
                   <div className="form-text">
                     LIMIT → needs <strong>Price</strong>. SL-L → needs <strong>Price</strong> &amp; <strong>Trig</strong>. SL-M → needs <strong>Trig</strong>.
