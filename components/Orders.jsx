@@ -10,10 +10,11 @@ export default function Orders() {
   const [selectedIds, setSelectedIds] = useState({});
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  // modify modal state (no Price field)
+  // modify modal state
   const [showModify, setShowModify] = useState(false);
   const [modifyTarget, setModifyTarget] = useState(null); // {name, symbol, order_id}
   const [modQty, setModQty] = useState('');
+  const [modPrice, setModPrice] = useState('');
   const [modTrig, setModTrig] = useState('');
   const [modType, setModType] = useState('NO_CHANGE'); // LIMIT / MARKET / STOP_LOSS / STOP_LOSS_MARKET / NO_CHANGE
   const [modLTP, setModLTP] = useState('—');           // read-only display
@@ -98,10 +99,18 @@ export default function Orders() {
   };
 
   // -------- Modify (single pending order) --------
+  const requires = (type) => {
+    const t = String(type || '').toUpperCase();
+    return {
+      price: t === 'LIMIT' || t === 'STOP_LOSS',
+      trig:  t === 'STOP_LOSS' || t === 'STOP_LOSS_MARKET',
+    };
+  };
+
   // optional LTP fetcher (safe no-op if API not present)
   const tryFetchLTP = async (symbol) => {
     try {
-      // if you add an endpoint later, match it here; otherwise we keep '—'
+      // If you expose this endpoint later, this will populate LTP; otherwise it stays "—"
       const r = await api.get('/ltp', { params: { symbol } });
       const v = Number(r?.data?.ltp);
       if (!Number.isNaN(v)) setModLTP(v.toFixed(2));
@@ -118,6 +127,7 @@ export default function Orders() {
         chosen.push({
           name: tds[1]?.textContent.trim(),
           symbol: tds[2]?.textContent.trim(),
+          price: tds[5]?.textContent.trim(),
           order_id: tds[7]?.textContent.trim(),
         });
       }
@@ -128,44 +138,72 @@ export default function Orders() {
 
     const row = chosen[0];
     setModifyTarget({ name: row.name, symbol: row.symbol, order_id: row.order_id });
-    setModQty('');
+
+    // Prefill with table price (if any); trigger left blank
+    const p = parseFloat(row.price);
+    setModPrice(!Number.isNaN(p) && p > 0 ? String(p) : '');
     setModTrig('');
+    setModQty('');
     setModType('NO_CHANGE');
     setModLTP('—');
     setShowModify(true);
-    // non-blocking best-effort LTP
+
     if (row.symbol) tryFetchLTP(row.symbol);
   };
 
   const submitModify = async () => {
     if (!modifyTarget) return;
 
-    // Build payload with only provided fields (no price)
-    const payload = { ...modifyTarget };
+    const need = requires(modType);
+    // Parse numbers up-front (only if user typed anything)
+    let qtyNum, priceNum, trigNum;
+
     if (modQty !== '') {
-      const q = parseInt(modQty, 10);
-      if (Number.isNaN(q) || q <= 0) return alert('Quantity must be a positive integer.');
-      payload.quantity = q;
+      qtyNum = parseInt(modQty, 10);
+      if (Number.isNaN(qtyNum) || qtyNum <= 0) return alert('Quantity must be a positive integer.');
+    }
+    if (modPrice !== '') {
+      priceNum = parseFloat(modPrice);
+      if (Number.isNaN(priceNum) || priceNum <= 0) return alert('Price must be a positive number.');
     }
     if (modTrig !== '') {
-      const t = parseFloat(modTrig);
-      if (Number.isNaN(t) || t <= 0) return alert('Trigger price must be a positive number.');
-      payload.triggerprice = t;
-    }
-    if (modType && modType !== 'NO_CHANGE') {
-      payload.ordertype = modType; // LIMIT / MARKET / STOP_LOSS / STOP_LOSS_MARKET
+      trigNum = parseFloat(modTrig);
+      if (Number.isNaN(trigNum) || trigNum <= 0) return alert('Trigger price must be a positive number.');
     }
 
-    if (!('quantity' in payload) && !('triggerprice' in payload) && !('ordertype' in payload)) {
-      return alert('Nothing to update. Change Qty / Trigger Price / Order Type.');
+    // Enforce required fields when an explicit order type is chosen
+    if (modType !== 'NO_CHANGE') {
+      if (need.price && !(modPrice !== '' && priceNum > 0)) {
+        return alert('Selected Order Type requires Price.');
+      }
+      if (need.trig && !(modTrig !== '' && trigNum > 0)) {
+        return alert('Selected Order Type requires Trigger Price.');
+      }
     }
+
+    // Ensure at least one thing is changing
+    if (
+      modType === 'NO_CHANGE' &&
+      modQty === '' &&
+      modPrice === '' &&
+      modTrig === ''
+    ) {
+      return alert('Nothing to update. Change Qty / Price / Trigger Price / Order Type.');
+    }
+
+    // Build payload (send only fields the user provided)
+    const payload = { ...modifyTarget };
+    if (modType && modType !== 'NO_CHANGE') payload.ordertype = modType;
+    if (modQty !== '') payload.quantity = qtyNum;
+    if (modPrice !== '') payload.price = priceNum;
+    if (modTrig !== '') payload.triggerprice = trigNum;
 
     try {
       busyRef.current = true;
       setModSaving(true);
       const res = await api.post('/modify_order', { order: payload });
       const msg = res.data?.message || 'Modify request sent';
-      alert(Array.isArray(msg) ? msg.join('\n') : msg);
+      alert(Array.isArray(msg) ? res.data.message.join('\n') : msg);
       setShowModify(false);
       setSelectedIds({});
       await fetchAll();
@@ -177,85 +215,106 @@ export default function Orders() {
     }
   };
 
-  const renderModifyModal = () => (
-    <Modal show={showModify} onHide={() => setShowModify(false)} backdrop="static" centered>
-      <Modal.Header closeButton>
-        <Modal.Title>Modify Order</Modal.Title>
-      </Modal.Header>
-      <Modal.Body>
-        {modifyTarget && (
-          <>
-            <div className="mb-3 small">
-              <div><strong>Symbol:</strong> {modifyTarget.symbol}</div>
-              <div><strong>Order ID:</strong> {modifyTarget.order_id}</div>
-            </div>
+  const renderModifyModal = () => {
+    const need = requires(modType);
+    return (
+      <Modal show={showModify} onHide={() => setShowModify(false)} backdrop="static" centered>
+        <Modal.Header closeButton>
+          <Modal.Title>Modify Order</Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          {modifyTarget && (
+            <>
+              <div className="mb-3 small">
+                <div><strong>Symbol:</strong> {modifyTarget.symbol}</div>
+                <div><strong>Order ID:</strong> {modifyTarget.order_id}</div>
+              </div>
 
-            {/* LTP (display only) */}
-            <div className="mb-2">
-              <div className="text-uppercase text-muted" style={{fontSize:'0.75rem'}}>LTP</div>
-              <div style={{fontWeight:700, fontSize:'1.1rem'}}>{modLTP}</div>
-            </div>
+              {/* LTP (display only) */}
+              <div className="mb-2">
+                <div className="text-uppercase text-muted" style={{fontSize:'0.75rem'}}>LTP</div>
+                <div style={{fontWeight:700, fontSize:'1.1rem'}}>{modLTP}</div>
+              </div>
 
-            <Form
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  submitModify();
-                }
-              }}
-            >
-              {/* Quantity */}
-              <Form.Group className="mb-3">
-                <Form.Label>Quantity</Form.Label>
-                <Form.Control
-                  type="number"
-                  min="1"
-                  step="1"
-                  value={modQty}
-                  onChange={(e) => setModQty(e.target.value)}
-                  placeholder="Leave blank to keep same"
-                />
-              </Form.Group>
+              <Form
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitModify();
+                  }
+                }}
+              >
+                {/* Quantity */}
+                <Form.Group className="mb-3">
+                  <Form.Label>Quantity</Form.Label>
+                  <Form.Control
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={modQty}
+                    onChange={(e) => setModQty(e.target.value)}
+                    placeholder="Leave blank to keep same"
+                  />
+                </Form.Group>
 
-              {/* Trigger Price */}
-              <Form.Group className="mb-3">
-                <Form.Label>Trig. Price</Form.Label>
-                <Form.Control
-                  type="number"
-                  min="0"
-                  step="0.05"
-                  value={modTrig}
-                  onChange={(e) => setModTrig(e.target.value)}
-                  placeholder="Leave blank to keep same"
-                />
-              </Form.Group>
+                {/* Price */}
+                <Form.Group className="mb-3">
+                  <Form.Label>
+                    Price {modType !== 'NO_CHANGE' && need.price ? <span className="text-danger">*</span> : null}
+                  </Form.Label>
+                  <Form.Control
+                    type="number"
+                    min="0"
+                    step="0.05"
+                    value={modPrice}
+                    onChange={(e) => setModPrice(e.target.value)}
+                    placeholder={need.price ? 'Required for selected type' : 'Leave blank to keep same'}
+                  />
+                </Form.Group>
 
-              {/* Order Type */}
-              <Form.Group className="mb-1">
-                <Form.Label>Order Type</Form.Label>
-                <Form.Select value={modType} onChange={(e)=>setModType(e.target.value)}>
-                  <option value="NO_CHANGE">NO_CHANGE</option>
-                  <option value="LIMIT">LIMIT</option>
-                  <option value="MARKET">MARKET</option>
-                  <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
-                  <option value="STOP_LOSS_MARKET">STOP_LOSS_MARKET (SL-M)</option>
-                </Form.Select>
-                <div className="form-text">
-                  Keep default values & change only what you need. Press <kbd>Enter</kbd> to submit.
-                </div>
-              </Form.Group>
-            </Form>
-          </>
-        )}
-      </Modal.Body>
-      <Modal.Footer>
-        <Button variant="secondary" onClick={() => setShowModify(false)} disabled={modSaving}>Cancel</Button>
-        <Button variant="warning" onClick={submitModify} disabled={modSaving}>
-          {modSaving ? 'Updating…' : 'Modify'}
-        </Button>
-      </Modal.Footer>
-    </Modal>
-  );
+                {/* Trigger Price */}
+                <Form.Group className="mb-3">
+                  <Form.Label>
+                    Trig. Price {modType !== 'NO_CHANGE' && need.trig ? <span className="text-danger">*</span> : null}
+                  </Form.Label>
+                  <Form.Control
+                    type="number"
+                    min="0"
+                    step="0.05"
+                    value={modTrig}
+                    onChange={(e) => setModTrig(e.target.value)}
+                    placeholder={need.trig ? 'Required for selected type' : 'Leave blank to keep same'}
+                  />
+                </Form.Group>
+
+                {/* Order Type */}
+                <Form.Group className="mb-1">
+                  <Form.Label>Order Type</Form.Label>
+                  <Form.Select value={modType} onChange={(e)=>setModType(e.target.value)}>
+                    <option value="NO_CHANGE">NO_CHANGE</option>
+                    <option value="LIMIT">LIMIT</option>
+                    <option value="MARKET">MARKET</option>
+                    <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
+                    <option value="STOP_LOSS_MARKET">STOP_LOSS_MARKET (SL-M)</option>
+                  </Form.Select>
+                  <div className="form-text">
+                    LIMIT → needs <strong>Price</strong>. SL-L → needs <strong>Price</strong> &amp; <strong>Trig</strong>. SL-M → needs <strong>Trig</strong>.
+                    Keep default values &amp; change only what you need. Press <kbd>Enter</kbd> to submit.
+                  </div>
+                </Form.Group>
+              </Form>
+            </>
+          )}
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant="secondary" onClick={() => setShowModify(false)} disabled={modSaving}>Cancel</Button>
+          <Button variant="warning" onClick={submitModify} disabled={modSaving}>
+            {modSaving ? 'Updating…' : 'Modify'}
+          </Button>
+        </Modal.Footer>
+      </Modal>
+    );
+  };
 
   const renderTable = (rows, id) => (
     <Table bordered hover size="sm" id={id}>
