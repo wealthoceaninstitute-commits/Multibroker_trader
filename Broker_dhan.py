@@ -694,7 +694,6 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-# --- Optional: batch wrapper used by the router when available ---
 # Broker_dhan.py
 import os, json, requests
 from typing import Any, Dict, List
@@ -773,6 +772,8 @@ def modify_orders(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             out_msgs.append(f"❌ HTTP error for {it.get('name','?')} ({order_id}): {e}")
 
     return {"message": out_msgs}
+
+
 
 
 
