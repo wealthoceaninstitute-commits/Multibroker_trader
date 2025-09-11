@@ -694,35 +694,72 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-# Broker_dhan.py
-import os, json, requests
-from typing import Any, Dict, List
-
-def modify_orders(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def modify_orders(orders):
     """
-    items: built by router, each like:
-      {
-        "name": "...",
-        "order_id": "11211182045",
-        "orderType": "LIMIT|MARKET|STOPLOSS_LIMIT|STOPLOSS_MARKET" (optional),
-        "quantity": 40 (optional),
-        "price": 33345.80 (optional),
-        "triggerPrice": 33300.00 (optional),
-        "validity": "DAY|IOC",
-        "_client_json": {...}  # must contain 'userid' and 'apikey'
-      }
-    Logs the exact request body and the response for each order.
+    Modify one or more Dhan orders.
+    - Logs OUT (URL + payload) and IN (status + response) for each order.
+    - Expects each item to contain: name, order_id, and any of
+      order_type, validity, price, triggerprice, quantity, disclosedquantity.
     """
-    out_msgs: List[str] = []
+    import os, json, requests, sys
 
-    for it in (items or []):
-        cj   = (it.get("_client_json") or {})
-        token = (cj.get("apikey") or "").strip()
-        client_id = (cj.get("userid") or cj.get("client_id") or "").strip()
-        order_id  = str(it.get("order_id") or "").strip()
+    BASE_DIR  = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
+    DHAN_DIR  = os.path.join(BASE_DIR, "clients", "dhan")
 
-        if not token or not client_id or not order_id:
-            out_msgs.append(f"❌ {it.get('name','?')}: missing token/client_id/order_id")
+    def _load_client_json_by_name(name: str):
+        needle = (name or "").strip().lower()
+        try:
+            for fn in os.listdir(DHAN_DIR):
+                if not fn.endswith(".json"):
+                    continue
+                with open(os.path.join(DHAN_DIR, fn), "r", encoding="utf-8") as f:
+                    cj = json.load(f)
+                nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
+                if nm == needle:
+                    return cj
+        except FileNotFoundError:
+            pass
+        return None
+
+    def _map_order_type(ui_val: str) -> str | None:
+        if not ui_val:
+            return None
+        s = ui_val.strip().upper().replace(" ", "").replace("_", "-")
+        # Accepted by Dhan: LIMIT | MARKET | SL | SL-M
+        if s in ("LIMIT", "MARKET", "SL", "SL-M"):
+            return s
+        if s in ("STOPLOSS", "STOP-LOSS", "SL-L"):
+            return "SL"
+        if s in ("SLMARKET", "SL-MARKET", "STOPLOSSMARKET", "STOP-LOSS-MARKET"):
+            return "SL-M"
+        return None
+
+    def _map_validity(v: str) -> str | None:
+        if not v:
+            return None
+        v = v.strip().upper()
+        if v in ("DAY", "IOC"):
+            return v
+        return None
+
+    messages = []
+
+    for od in (orders or []):
+        name     = od.get("name", "")
+        order_id = str(od.get("order_id") or od.get("orderId") or "").strip()
+        if not order_id:
+            messages.append(f"❌ Dhan modify: missing order_id for {name}")
+            continue
+
+        cj = _load_client_json_by_name(name)
+        if not cj:
+            messages.append(f"❌ Dhan modify: client JSON not found for {name}")
+            continue
+
+        token  = (cj.get("apikey") or "").strip()
+        userid = (cj.get("userid") or "").strip()
+        if not token or not userid:
+            messages.append(f"❌ Dhan modify: missing token/userid for {name}")
             continue
 
         url = f"https://api.dhan.co/v2/orders/{order_id}"
@@ -731,47 +768,89 @@ def modify_orders(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             "access-token": token,
         }
 
-        # Build DHAN body (send only provided fields; DHAN requires correct combos)
-        body: Dict[str, Any] = {
-            "dhanClientId": client_id,
-            "orderId": order_id,
-            "validity": (it.get("validity") or "DAY").upper(),
+        body = {
+            "dhanClientId": userid,
+            "legName": "",  # keep explicit to match docs
         }
-        if it.get("orderType"):    body["orderType"] = it["orderType"]
-        if it.get("quantity") is not None:      body["quantity"] = str(int(it["quantity"]))
-        if it.get("price") is not None:         body["price"] = str(float(it["price"]))
-        if it.get("triggerPrice") is not None:  body["triggerPrice"] = str(float(it["triggerPrice"]))
 
-        # ---- DEBUG LOGS (sanitized) ----
+        # Optional/changed fields only
+        ot = _map_order_type(od.get("order_type") or od.get("ordertype"))
+        if ot:
+            body["orderType"] = ot
+
+        val = _map_validity(od.get("validity") or od.get("orderduration"))
+        if val:
+            body["validity"] = val
+
+        if od.get("quantity") not in (None, "", 0, "0"):
+            try:
+                body["quantity"] = int(float(od["quantity"]))
+            except Exception:
+                pass
+
+        dq = od.get("disclosedquantity")
+        if dq not in (None, "", 0, "0"):
+            try:
+                body["disclosedQuantity"] = int(float(dq))
+            except Exception:
+                pass
+
+        pr = od.get("price")
+        if pr not in (None, "", 0, "0"):
+            body["price"] = str(pr)
+
+        trig = od.get("triggerprice") or od.get("triggerPrice") or od.get("trig_price")
+        if trig not in (None, "", 0, "0"):
+            body["triggerPrice"] = str(trig)
+
+        # ---- DEBUG OUT: what we are sending to Dhan (token masked) ----
         try:
-            masked = (len(token) > 8 and (token[:4] + "..." + token[-4:])) or "****"
-            print("\n[Broker_dhan.modify_orders] OUTBOUND ↓")
-            print("PUT", url)
-            print("Headers:", {"Content-Type": "application/json", "access-token": masked})
-            print("Body:", json.dumps(body, indent=2))
+            print("---- Dhan ModifyOrder (OUT) ----")
+            print(json.dumps({
+                "name": name,
+                "order_id": order_id,
+                "url": url,
+                "headers": {"Content-Type": "application/json", "access-token": "***"},
+                "payload": body
+            }, indent=2))
+            sys.stdout.flush()
         except Exception:
             pass
 
+        # Call Dhan API
         try:
             resp = requests.put(url, headers=headers, json=body, timeout=25)
-            text = ""
             try:
-                text = json.dumps(resp.json(), indent=2)
+                rj = resp.json()
             except Exception:
-                text = resp.text
+                rj = {"raw": resp.text}
 
-            # log response
-            print("[Broker_dhan.modify_orders] RESPONSE", resp.status_code)
-            print(text)
+            # ---- DEBUG IN: what Dhan responded with ----
+            try:
+                print("---- Dhan ModifyOrder (IN) ----")
+                print(json.dumps({
+                    "name": name,
+                    "order_id": order_id,
+                    "status_code": resp.status_code,
+                    "response": rj
+                }, indent=2))
+                sys.stdout.flush()
+            except Exception:
+                pass
 
-            if 200 <= resp.status_code < 300:
-                out_msgs.append(f"✅ Modified {order_id} for {it.get('name','?')}")
+            ok = (resp.status_code == 200) and (isinstance(rj, dict) and str(rj.get("status", "")).lower() == "success")
+            if ok:
+                messages.append(f"✅ Dhan modify ok for {name} ({order_id})")
             else:
-                out_msgs.append(f"❌ Modify failed for {it.get('name','?')} ({order_id}): {text}")
+                messages.append(f"❌ Dhan modify failed for {name} ({order_id}): {rj}")
         except Exception as e:
-            out_msgs.append(f"❌ HTTP error for {it.get('name','?')} ({order_id}): {e}")
+            print(f"[Broker_dhan.modify_orders] exception for {name} ({order_id}): {e}")
+            sys.stdout.flush()
+            messages.append(f"❌ Dhan modify error for {name} ({order_id}): {e}")
 
-    return {"message": out_msgs}
+    return {"message": messages}
+
+
 
 
 
