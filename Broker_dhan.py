@@ -695,116 +695,123 @@ def modify_order_dhan(
 
 
 # Broker_dhan.py
-import json
-import requests
-from typing import Dict, List, Any
+import json, requests
 
-DHAN_BASE = "https://api.dhan.co/v2"
+DHAN_BASE = "https://api.dhan.co"
 
-def _mask(tok: str) -> str:
-    if not tok:
-        return "****"
-    return tok[:3] + "****" + tok[-3:]
-
-def _headers(token: str) -> Dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "access-token": token or ""
-    }
-
-def _fetch_order_type_if_missing(token: str, order_id: str) -> str | None:
-    """Fallback: read current orderType from Dhan to reuse when user left type as NO_CHANGE."""
-    try:
-        url = f"{DHAN_BASE}/orders/{order_id}"
-        r = requests.get(url, headers=_headers(token), timeout=10)
-        if r.status_code == 200:
-            data = r.json() or {}
-            ot = (data.get("orderType") or "").strip()
-            return ot or None
-    except Exception:
-        pass
-    return None
-
-def modify_orders(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def modify_orders(rows: list[dict]) -> dict:
     """
-    rows: [
-      {
-        "name": "...",
-        "order_id": "...",
-        "validity": "DAY",
-        "orderType"?: "LIMIT|MARKET|STOP_LOSS|STOP_LOSS_MARKET",
-        "quantity"?: int,
-        "price"?: float,
-        "triggerPrice"?: float,
-        "_client_json": { "userid": "...", "apikey": "..." }
-      },
-      ...
-    ]
+    rows: [{
+      name, order_id, validity,
+      orderType?, price?, triggerPrice?, quantity?,
+      _client_json: {userid, apikey}
+    }]
+    Returns: { "message": [ ... ] }
     """
-    messages: List[str] = []
+    msgs: list[str] = []
 
-    for r in rows:
-        name = r.get("name", "")
-        oid  = str(r.get("order_id", "")).strip()
-        cj   = r.get("_client_json") or {}
+    for row in rows:
+        cj        = row.get("_client_json") or {}
         token     = (cj.get("apikey") or "").strip()
-        client_id = (cj.get("userid") or cj.get("client_id") or "").strip()
+        client_id = (cj.get("userid") or "").strip()
+        oid       = str(row.get("order_id") or "").strip()
 
-        if not (oid and token and client_id):
-            messages.append(f"❌ Dhan modify failed for {name} ({oid}): missing token/client_id")
+        if not token or not client_id or not oid:
+            msgs.append(f"❌ Dhan modify skipped for {row.get('name','')}: missing token/clientId/order_id")
             continue
 
-        order_type = (r.get("orderType") or "").strip()
-        if not order_type:
-            order_type = _fetch_order_type_if_missing(token, oid)
+        ot    = row.get("orderType")  # already mapped to Dhan enums by router if present
+        price = row.get("price", None)
+        trig  = row.get("triggerPrice", None)
+        qty   = row.get("quantity", None)
 
-        payload: Dict[str, Any] = {
+        # type sanitize
+        def _num_or_none(v, cast=float):
+            try: return cast(v)
+            except Exception: return None
+
+        if price is not None: price = _num_or_none(price, float)
+        if trig  is not None: trig  = _num_or_none(trig,  float)
+        if qty   is not None: qty   = _num_or_none(qty,   int)
+
+        # derive orderType when user chose NO_CHANGE but changed numbers
+        if not ot:
+            if trig is not None and price is not None:
+                ot = "STOP_LOSS"
+            elif trig is not None and price is None:
+                ot = "STOP_LOSS_MARKET"
+            elif price is not None:
+                ot = "LIMIT"
+
+        # validate combos to avoid DH-905
+        if ot == "LIMIT":
+            if price is None:
+                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): LIMIT requires price.")
+                continue
+            trig = None
+        elif ot == "STOP_LOSS":
+            if price is None or trig is None:
+                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS requires price & triggerPrice.")
+                continue
+        elif ot == "STOP_LOSS_MARKET":
+            if trig is None:
+                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS_MARKET requires triggerPrice.")
+                continue
+            price = None
+        elif ot == "MARKET":
+            price = None
+            trig  = None
+        else:
+            msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): orderType missing/invalid.")
+            continue
+
+        payload = {
             "dhanClientId": client_id,
             "orderId": oid,
-            "validity": r.get("validity", "DAY"),
-            "orderType": order_type,      # Dhan requires this
-            "legName": ""
+            "orderType": ot,
+            "legName": "",
+            "validity": (row.get("validity") or "DAY").upper()
         }
-        if r.get("quantity") is not None:
-            payload["quantity"] = int(r["quantity"])
-        if r.get("price") is not None:
-            payload["price"] = float(r["price"])          # numeric
-        if r.get("triggerPrice") is not None:
-            payload["triggerPrice"] = float(r["triggerPrice"])
+        if qty   is not None: payload["quantity"]     = qty
+        if price is not None: payload["price"]        = price
+        if trig  is not None: payload["triggerPrice"] = trig
 
-        url = f"{DHAN_BASE}/orders/{oid}"
+        url = f"{DHAN_BASE}/v2/orders/{oid}"
+        headers = {"Content-Type": "application/json", "access-token": token}
 
-        # ---- safe debug log
+        # safe debug
         try:
-            print("---- Dhan ModifyOrder (OUT) ----")
-            print(json.dumps({
-                "url": url,
-                "headers": {"Content-Type": "application/json", "access-token": _mask(token)},
-                "payload": payload
-            }, indent=2, default=str))
+            safe_headers = {**headers, "access-token": "****"}
+            print("---- Dhan ModifyOrder (REQ) ----")
+            print(json.dumps({"url": url, "headers": safe_headers, "payload": payload}, indent=2))
         except Exception:
             pass
 
         try:
-            resp = requests.put(url, headers=_headers(token), json=payload, timeout=15)
-            status = resp.status_code
+            resp = requests.put(url, json=payload, headers=headers, timeout=15)
             try:
                 body = resp.json()
             except Exception:
-                body = {"text": resp.text}
+                body = resp.text
 
-            print("---- Dhan ModifyOrder (RESP) ----")
-            print(json.dumps({"status_code": status, "response": body}, indent=2, default=str))
+            try:
+                print("---- Dhan ModifyOrder (RESP) ----")
+                print(json.dumps({"status_code": resp.status_code, "response": body}, indent=2))
+            except Exception:
+                pass
 
-            if 200 <= status < 300:
-                messages.append(f"✅ Dhan modify OK for {name} ({oid})")
+            if resp.status_code in (200, 201) and isinstance(body, dict) and str(body.get("status","")).lower() == "success":
+                msgs.append(f"✅ Dhan modified order {oid} for {row.get('name','')}")
             else:
-                msg = body.get("errorMessage") if isinstance(body, dict) else body
-                messages.append(f"❌ Dhan modify failed for {name} ({oid}): {msg}")
+                # surface Dhan’s message when available
+                err = body.get("errorMessage") if isinstance(body, dict) else body
+                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): {err}")
         except Exception as e:
-            messages.append(f"❌ Dhan modify failed for {name} ({oid}): {e}")
+            msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): {e}")
 
-    return {"message": messages}
+    return {"message": msgs}
+
+
 
 
 
