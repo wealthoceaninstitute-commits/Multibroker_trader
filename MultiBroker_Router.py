@@ -1690,161 +1690,132 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 @app.post("/modify_order")
 def route_modify_order(payload: Dict[str, Any] = Body(...)):
     """
-    Modify pending orders.
-
-    Accepts either:
-      { "order": { name, order_id, ... }, ... }   # single
-      or
-      { "orders": [{ name, order_id, ...}, ...], "price"?, "triggerprice"?, "orderType"?, "validity"? }
-
-    Important:
-      - Dhan requires orderType: LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
-      - If the user leaves "order type" as NO_CHANGE, we infer a safe type from what changed.
-      - We never stringify numbers; price/trigger stay numeric.
-      - Logs redact tokens.
+    Normalize UI input, infer a valid Dhan orderType when user picked NO_CHANGE,
+    and send a clean broker-specific payload. Token is masked in logs.
+    Accepts: {"order": {...}} or {"orders":[...]} plus optional price/trigger/qty/orderType/validity.
     """
-    import json, copy
+    import json, importlib, os
 
-    # ---- log inbound (safe)
-    try:
-        print("\n[/modify_order] INBOUND ↓")
-        print(json.dumps(payload, indent=2, default=str))
-    except Exception:
-        pass
-
-    # normalize single -> list
-    orders = payload.get("orders")
-    if not orders and "order" in payload:
-        orders = [payload["order"]]
-    if not isinstance(orders, list) or not orders:
+    # --- accept both single and batch shapes ---
+    if isinstance(payload.get("orders"), list):
+        raw_orders = payload["orders"]
+    elif isinstance(payload.get("order"), dict):
+        raw_orders = [payload["order"]]
+    else:
         raise HTTPException(status_code=400, detail="No orders provided.")
 
-    # user inputs (may be blank)
-    qty_in = payload.get("quantity", "")
+    # top level modify fields (UI may put them here)
+    qty_in = payload.get("quantity", payload.get("qty", ""))
     prc_in = payload.get("price", "")
-    trg_in = payload.get("triggerprice", payload.get("trig_price", ""))
-    ot_in  = (payload.get("orderType") or payload.get("ordertype") or "NO_CHANGE").upper().strip()
-    val_in = (payload.get("validity")  or payload.get("timeForce") or "DAY").upper().strip()
+    trg_in = payload.get("triggerprice", payload.get("triggerPrice", payload.get("trig_price", "")))
+    ot_in  = payload.get("orderType", payload.get("ordertype", "")) or ""
+    val_in = (payload.get("validity") or payload.get("timeForce") or "DAY").upper()
 
-    def _to_int_or_none(x):
+    def _num_or_none(v, cast=float):
         try:
-            s = str(x).strip()
-            return None if s == "" else int(float(s))
+            s = str(v).strip()
+            if s == "":
+                return None
+            return cast(s)
         except Exception:
             return None
 
-    def _to_float_or_none(x):
-        try:
-            s = str(x).strip()
-            return None if s == "" else float(s)
-        except Exception:
-            return None
+    qty  = _num_or_none(qty_in, int)
+    prc  = _num_or_none(prc_in, float)
+    trig = _num_or_none(trg_in, float)
 
-    qty  = _to_int_or_none(qty_in)
-    prc  = _to_float_or_none(prc_in)
-    trig = _to_float_or_none(trg_in)
-
-    # Map UI → Dhan enums
-    def _map_to_dhan(ot: str) -> str | None:
-        m = {
-            "LIMIT": "LIMIT",
-            "MARKET": "MARKET",
-            "STOPLOSS": "STOP_LOSS",
-            "SL_LIMIT": "STOP_LOSS",
-            "SL-MARKET": "STOP_LOSS_MARKET",
-            "SL_MARKET": "STOP_LOSS_MARKET",
-            "STOPLOSS_MARKET": "STOP_LOSS_MARKET",
-            "NO_CHANGE": None,
-            "": None,
-        }
-        return m.get((ot or "").strip().upper(), None)
-
-    # If user kept "No change", infer a type from the changed fields
-    def _infer_type_if_missing(prc_val: float | None, trig_val: float | None) -> str | None:
-        if trig_val is not None and prc_val is None:
-            return "STOP_LOSS_MARKET"
-        if trig_val is not None and prc_val is not None:
-            return "STOP_LOSS"
-        if prc_val is not None and trig_val is None:
-            return "LIMIT"
+    def _map_ui_to_dhan(ot: str | None, prc, trig) -> str | None:
+        """Map UI radios to Dhan. If NO_CHANGE, infer from provided fields."""
+        if ot:
+            o = ot.upper().replace("-", "_")
+            if o == "STOPLOSS":          return "STOP_LOSS"
+            if o == "SL_LIMIT":          return "STOP_LOSS"
+            if o == "SL_MARKET":         return "STOP_LOSS_MARKET"
+            if o in ("LIMIT","MARKET","STOP_LOSS","STOP_LOSS_MARKET"):
+                return o
+            if o in ("NO_CHANGE","UNCHANGED"):
+                ot = None  # fall through
+        # infer type from which fields were provided
+        if trig is not None and prc is not None:  return "STOP_LOSS"
+        if trig is not None and prc is None:      return "STOP_LOSS_MARKET"
+        if prc  is not None:                      return "LIMIT"
         return None
 
-    by_broker = {"dhan": [], "motilal": []}
-
-    # small helper: get client json by display name
-    def _load_client_json(broker: str, name: str) -> Dict[str, Any] | None:
-        folder = DHAN_DIR if broker == "dhan" else MO_DIR
+    # load client json for dhan
+    def _load_dhan_client_json(name: str) -> dict | None:
         needle = (name or "").strip().lower()
         try:
-            for fn in os.listdir(folder):
+            for fn in os.listdir(DHAN_DIR):
                 if not fn.endswith(".json"):
                     continue
-                p = os.path.join(folder, fn)
+                p = os.path.join(DHAN_DIR, fn)
                 with open(p, "r", encoding="utf-8") as f:
                     cj = json.load(f)
                 nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
                 if nm == needle:
                     return cj
         except FileNotFoundError:
-            return None
+            pass
         return None
 
-    # bucket + build rows
-    for od in orders:
+    rows_dhan, rows_mo = [], []
+
+    for od in raw_orders:
         name = (od or {}).get("name", "")
-        oid  = (od or {}).get("order_id", "")
+        oid  = str((od or {}).get("order_id", "")).strip()
         if not name or not oid:
-            # skip malformed
             continue
 
-        brk  = _guess_broker_from_order(od) or _broker_by_client_name(name)
-        if brk not in by_broker:
-            continue
+        # pick broker by order-id shape
+        brk = "dhan" if oid.isdigit() else "motilal"
 
         row = {
             "name": name,
-            "order_id": str(oid),
+            "order_id": oid,
             "validity": val_in or "DAY",
-            **({"quantity": qty} if qty is not None else {}),
-            **({"price": prc}   if prc is not None else {}),             # numeric
-            **({"triggerPrice": trig} if trig is not None else {}),      # numeric
         }
+        if qty  is not None: row["quantity"]     = qty
+        if prc  is not None: row["price"]        = prc
+        if trig is not None: row["triggerPrice"] = trig
+
+        mapped = _map_ui_to_dhan(ot_in, prc, trig)
+        if mapped is not None:
+            row["orderType"] = mapped
 
         if brk == "dhan":
-            mapped = _map_to_dhan(ot_in) or _infer_type_if_missing(prc, trig)
-            if mapped:
-                row["orderType"] = mapped
-            cj = _load_client_json("dhan", name) or {}
-            row["_client_json"] = cj
-            by_broker["dhan"].append(row)
+            cj = _load_dhan_client_json(name) or {}
+            row["_client_json"] = {"userid": cj.get("userid", ""), "apikey": cj.get("apikey", "")}
+            rows_dhan.append(row)
         else:
-            by_broker["motilal"].append(row)
+            rows_mo.append(row)
 
-    # safe log (redact tokens)
+    # -------- logging (mask secrets) --------
     try:
-        if by_broker["dhan"]:
-            safe = copy.deepcopy(by_broker["dhan"])
-            for r in safe:
-                if isinstance(r.get("_client_json"), dict) and r["_client_json"].get("apikey"):
+        print("\n[/modify_order] INBOUND ↓")
+        print(json.dumps(payload, indent=2, default=str))
+        if rows_dhan:
+            scrub = json.loads(json.dumps(rows_dhan))
+            for r in scrub:
+                if r.get("_client_json", {}).get("apikey"):
                     r["_client_json"]["apikey"] = "****"
-            print("\n[/modify_order] DHAN payload (to Broker_dhan.modify_orders) ↓")
-            print(json.dumps(safe, indent=2, default=str))
-        if by_broker["motilal"]:
-            print("\n[/modify_order] MOTILAL payload (to Broker_motilal.modify_orders) ↓")
-            print(json.dumps(by_broker["motilal"], indent=2, default=str))
+            print("\n[/modify_order] DHAN payload ↓")
+            print(json.dumps(scrub, indent=2))
+        if rows_mo:
+            print("\n[/modify_order] MOTILAL payload ↓")
+            print(json.dumps(rows_mo, indent=2))
     except Exception:
         pass
 
     messages: list[str] = []
 
-    # ---- Dhan
-    if by_broker["dhan"]:
+    # ---- Dhan ----
+    if rows_dhan:
         try:
             dh = importlib.import_module("Broker_dhan")
-            if hasattr(dh, "modify_orders") and callable(getattr(dh, "modify_orders")):
-                res = dh.modify_orders(by_broker["dhan"])
+            if hasattr(dh, "modify_orders"):
+                res = dh.modify_orders(rows_dhan)
                 if isinstance(res, dict) and isinstance(res.get("message"), list):
-                    messages.extend([str(x) for x in res["message"]])
+                    messages += [str(x) for x in res["message"]]
                 else:
                     messages.append(str(res))
             else:
@@ -1852,14 +1823,14 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
         except Exception as e:
             messages.append(f"❌ dhan modify failed: {e}")
 
-    # ---- Motilal (no-op if you don't support it yet)
-    if by_broker["motilal"]:
+    # ---- Motilal (if you support it) ----
+    if rows_mo:
         try:
             mo = importlib.import_module("Broker_motilal")
-            if hasattr(mo, "modify_orders") and callable(getattr(mo, "modify_orders")):
-                res = mo.modify_orders(by_broker["motilal"])
+            if hasattr(mo, "modify_orders"):
+                res = mo.modify_orders(rows_mo)
                 if isinstance(res, dict) and isinstance(res.get("message"), list):
-                    messages.extend([str(x) for x in res["message"]])
+                    messages += [str(x) for x in res["message"]]
                 else:
                     messages.append(str(res))
             else:
@@ -1867,7 +1838,8 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
         except Exception as e:
             messages.append(f"❌ motilal modify failed: {e}")
 
-    return {"message": messages}
+    return {"message": messages or ["No changes to apply."]}
+
 
 
 
@@ -1877,6 +1849,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
