@@ -618,6 +618,207 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {"status": "completed", "order_responses": responses}
 
+# --- Motilal: batch order modify ------------------------------------
+from typing import Dict, Any, List
+from datetime import datetime
+import os, json
+
+# Where the client JSONs live (same convention as your router)
+_BASE_DIR = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
+_MO_DIR   = os.path.join(_BASE_DIR, "clients", "motilal")
+
+def _map_ui_to_mo_type(ot: str | None, price, trig) -> str:
+    """
+    Map UI/Router order type to Motilal codes.
+    Fallback: infer from presence of price/trigger.
+    """
+    def _has(x):
+        if x is None: return False
+        s = str(x).strip()
+        if s == "": return False
+        try:
+            return float(s) > 0
+        except Exception:
+            return True
+
+    u = (ot or "").strip().upper().replace("-", "_")
+    m = {
+        "LIMIT": "LIMIT",
+        "MARKET": "MARKET",
+        "STOP_LOSS": "SL",
+        "STOPLOSS": "SL",
+        "SL": "SL",
+        "SL_LIMIT": "SL",
+        "STOP_LOSS_MARKET": "SL-M",
+        "STOPLOSS_MARKET": "SL-M",
+        "SL_MARKET": "SL-M",
+        "NO_CHANGE": "",
+        "": "",
+    }
+    mapped = m.get(u, "")
+    if mapped:
+        return mapped
+    # infer
+    has_p = _has(price)
+    has_t = _has(trig)
+    if has_t and has_p:   return "SL"     # SL-limit
+    if has_t and not has_p: return "SL-M" # SL-market
+    if has_p and not has_t: return "LIMIT"
+    return "MARKET"
+
+def _load_mo_client_json_by_name(name: str) -> Dict[str, Any] | None:
+    """Find a Motilal client json by human name (case-insensitive)."""
+    needle = (name or "").strip().lower()
+    try:
+        for fn in os.listdir(_MO_DIR):
+            if not fn.endswith(".json"):
+                continue
+            path = os.path.join(_MO_DIR, fn)
+            with open(path, "r", encoding="utf-8") as f:
+                cj = json.load(f)
+            nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
+            if nm == needle:
+                return cj
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return None
+
+def _build_motilal_modify_payload(row: Dict[str, Any], clientcode: str) -> Dict[str, Any]:
+    """
+    Build exactly the ModifiedOrderInfo the Motilal SDK expects.
+    All numeric fields are sent as numbers (int/float).
+    """
+    def _i(x, default=0):
+        try:
+            s = str(x).strip()
+            if s == "": return default
+            return int(float(s))
+        except Exception:
+            return default
+
+    def _f(x, default=0.0):
+        try:
+            s = str(x).strip()
+            if s == "": return default
+            return float(s)
+        except Exception:
+            return default
+
+    price = row.get("price")
+    trig  = row.get("triggerPrice", row.get("triggerprice"))
+
+    payload = {
+        "clientcode":          str(clientcode),
+        "uniqueorderid":       str(row.get("order_id") or row.get("orderId") or ""),
+        "newordertype":        _map_ui_to_mo_type(row.get("orderType"), price, trig),
+        "neworderduration":    str(row.get("validity") or "DAY").upper(),
+        "newquantityinlot":    _i(row.get("quantity"), 0),
+        "newdisclosedquantity": 0,                                # always 0, never ""
+        "newprice":            _f(price, 0.0),
+        "newtriggerprice":     _f(trig, 0.0),
+        "newgoodtilldate":     _i(row.get("goodtilldate"), 0),    # keep 0 unless you support GTD
+        "lastmodifiedtime":    datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "qtytradedtoday":      _i(row.get("qtytradedtoday"), 0),
+    }
+    return payload
+
+def modify_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Batch modify pending Motilal orders.
+
+    Input rows (from router): { name, order_id, orderType, price?, triggerPrice?, quantity?, validity? }
+    Output: { "message": [ "...", ... ] }
+    """
+    messages: List[str] = []
+
+    # Try to use a global/logged-in Mofsl session if present in this module.
+    mofsl = globals().get("Mofsl")
+
+    for row in (orders or []):
+        try:
+            name = (row.get("name") or "").strip() or "<unknown>"
+            oid  = str(row.get("order_id") or row.get("orderId") or "").strip()
+            if not oid:
+                messages.append(f"ℹ️ {name}: skipped (missing order_id)")
+                continue
+
+            cj = _load_mo_client_json_by_name(name)
+            if not cj:
+                messages.append(f"❌ {name} ({oid}): client JSON not found")
+                continue
+
+            clientcode = str(cj.get("userid") or cj.get("client_id") or "").strip()
+            if not clientcode:
+                messages.append(f"❌ {name} ({oid}): missing clientcode")
+                continue
+
+            payload = _build_motilal_modify_payload(row, clientcode)
+
+            # Basic validations for explicit types (to avoid server-side reject)
+            ot = payload["newordertype"]
+            if ot == "LIMIT" and payload["newprice"] <= 0:
+                messages.append(f"❌ {name} ({oid}): LIMIT requires Price > 0")
+                continue
+            if ot == "SL" and (payload["newprice"] <= 0 or payload["newtriggerprice"] <= 0):
+                messages.append(f"❌ {name} ({oid}): SL requires Price & Trigger > 0")
+                continue
+            if ot == "SL-M" and payload["newtriggerprice"] <= 0:
+                messages.append(f"❌ {name} ({oid}): SL-M requires Trigger > 0")
+                continue
+
+            # --- DEBUG OUT ---
+            try:
+                print("---- Motilal ModifyOrder (OUT) ----")
+                print(json.dumps(payload, indent=2))
+            except Exception:
+                pass
+
+            if not mofsl or not hasattr(mofsl, "ModifyOrder"):
+                messages.append(f"❌ {name} ({oid}): Mofsl client not available (not logged in?)")
+                continue
+
+            resp = mofsl.ModifyOrder(payload)
+
+            # --- DEBUG RESP ---
+            try:
+                print("---- Motilal ModifyOrder (RESP) ----")
+                print(json.dumps(resp if isinstance(resp, dict) else {"raw": resp}, indent=2))
+            except Exception:
+                pass
+
+            # Heuristic success checks across common MO payloads
+            ok = False
+            err = ""
+            if isinstance(resp, dict):
+                # success flags seen in various MO responses
+                status = str(resp.get("Status") or resp.get("status") or "").lower()
+                msg    = resp.get("Message") or resp.get("message") or resp.get("ErrorMsg") or resp.get("errorMessage")
+                code   = str(resp.get("ErrorCode") or resp.get("errorCode") or "")
+                ok = ("success" in status) or (resp.get("Success") is True) or code in ("0","200","201")
+                err = msg or code
+            else:
+                # non-dict: treat truthy as success
+                ok = bool(resp)
+                err = "" if ok else str(resp)
+
+            if ok:
+                messages.append(f"✅ {name} ({oid}): Modified")
+            else:
+                messages.append(f"❌ {name} ({oid}): {err or 'modify failed'}")
+
+        except Exception as e:
+            messages.append(f"❌ {row.get('name','<unknown>')} ({row.get('order_id','?')}): {e}")
+
+    return {"message": messages}
+
+# Optional single-item convenience (not required by router)
+def modify_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    return modify_orders([order])
+
+
+
 
 
 
