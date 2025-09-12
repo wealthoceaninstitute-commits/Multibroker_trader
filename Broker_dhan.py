@@ -694,122 +694,76 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-# --- Dhan modify orders (drop-in) -------------------------------------------
-import os, json, requests
+import json, requests
 
-DHAN_BASE = os.environ.get("DHAN_BASE", "https://api.dhan.co/v2")
+DHAN_BASE = "https://api.dhan.co/v2"
 
-def _blank_or_str(x):
-    """Return '' for None/''/whitespace, else str(x) trimmed."""
-    if x is None:
-        return ""
-    s = str(x).strip()
-    return s if s else ""
+def _blank(x):
+    return "" if x is None or str(x).strip() == "" else str(x)
 
-def _infer_order_type(price_str: str, trig_str: str) -> str:
+def modify_orders(items):
     """
-    If UI sent NO_CHANGE (i.e., router gives us empty orderType),
-    infer a valid Dhan orderType so the API accepts the request.
-    """
-    has_price = bool(str(price_str).strip())
-    has_trig  = bool(str(trig_str).strip())
-
-    if has_trig and not has_price:
-        return "STOP_LOSS_MARKET"
-    if has_trig and has_price:
-        return "STOP_LOSS"
-    if has_price and not has_trig:
-        return "LIMIT"
-    # Nothing changed → default to LIMIT so the request stays valid
-    return "LIMIT"
-
-def modify_orders(rows):
-    """
-    rows: list of dicts from router, each like:
+    items: [
       {
-        "name": "Edison wife",
-        "order_id": "952509127687",
-        "validity": "DAY",
-        "quantity": "",            # or number/string; blank => keep same
-        "price": "",               # "
-        "triggerPrice": "",        # "
-        "orderType": "",           # mapped or blank (NO_CHANGE)
-        "_client_json": { "userid": "...", "apikey": "..." }
-      }
+        name, order_id, validity, quantity?, price?, triggerPrice?, orderType,
+        _client_json: { userid, apikey }
+      }, ...
+    ]
     """
-    messages = []
+    out = []
 
-    for r in rows or []:
-        cj   = (r.get("_client_json") or {})
-        dclid = _blank_or_str(cj.get("userid"))
-        token = _blank_or_str(cj.get("apikey"))
-        oid   = _blank_or_str(r.get("order_id"))
-        validity = (_blank_or_str(r.get("validity")) or "DAY").upper()
+    for it in items:
+        cj    = (it.get("_client_json") or {})
+        token = (cj.get("apikey") or "").strip()
+        dclid = (cj.get("userid") or "").strip()
+        oid   = (it.get("order_id") or "").strip()
 
-        # prepare all fields as strings (matches docs’ example format)
-        qty   = _blank_or_str(r.get("quantity"))
-        prc   = _blank_or_str(r.get("price"))
-        trig  = _blank_or_str(r.get("triggerPrice") or r.get("triggerprice"))
-        d_ot  = _blank_or_str(r.get("orderType"))  # may be blank (NO_CHANGE)
+        if not (token and dclid and oid):
+            out.append(f"❌ Dhan modify failed for {it.get('name','')}: missing token/client/order id")
+            continue
 
-        if not d_ot:
-            d_ot = _infer_order_type(prc, trig)
-
+        # Build payload EXACTLY per Dhan docs (all keys present)
         payload = {
-            "dhanClientId":       dclid,
-            "orderId":            oid,
-            "orderType":          d_ot,     # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
-            "legName":            "",       # keep empty unless you handle BO/CO legs
-            "quantity":           qty,      # keep blank to not change
-            "price":              prc,      # keep blank to not change
-            "disclosedQuantity":  _blank_or_str(r.get("disclosedQuantity")),  # usually blank
-            "triggerPrice":       trig,     # keep blank to not change
-            "validity":           validity  # DAY | IOC
+            "dhanClientId":      _blank(dclid),
+            "orderId":           _blank(oid),
+            "orderType":         _blank(it.get("orderType")),          # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
+            "legName":           "",                                    # BO/CO only; keep empty
+            "quantity":          _blank(it.get("quantity")),            # blank if not changing
+            "price":             _blank(it.get("price")),               # blank if not changing
+            "disclosedQuantity": "",                                    # not used here
+            "triggerPrice":      _blank(it.get("triggerPrice")),        # blank if not changing
+            "validity":          _blank(it.get("validity") or "DAY"),   # DAY | IOC
         }
 
-        url = f"{DHAN_BASE}/orders/{oid}"
-        headers = {
-            "Content-Type": "application/json",
-            "access-token": token,
-        }
+        url     = f"{DHAN_BASE}/orders/{oid}"
+        headers = {"Content-Type": "application/json", "access-token": token}
 
         # Safe debug (mask token)
-        try:
-            safe_headers = dict(headers)
-            if safe_headers.get("access-token"):
-                safe_headers["access-token"] = "****"
-            print("---- Dhan ModifyOrder (OUT) ----")
-            print(json.dumps({"url": url, "headers": safe_headers, "payload": payload}, indent=2))
-        except Exception:
-            pass
+        dbg_headers = {"Content-Type": "application/json", "access-token": "****"}
+        print("---- Dhan ModifyOrder (OUT) ----")
+        print(json.dumps({"url": url, "headers": dbg_headers, "payload": payload}, indent=2))
 
         try:
-            resp = requests.put(url, headers=headers, json=payload, timeout=20)
+            r = requests.put(url, headers=headers, json=payload, timeout=15)
             try:
-                body = resp.json()
+                body = r.json()
             except Exception:
-                body = {"text": resp.text}
+                body = {"text": r.text}
 
-            try:
-                print("---- Dhan ModifyOrder (RESP) ----")
-                safe_body = dict(body) if isinstance(body, dict) else body
-                print(json.dumps({"status_code": resp.status_code, "response": safe_body}, indent=2))
-            except Exception:
-                pass
+            print("---- Dhan ModifyOrder (RESP) ----")
+            print(json.dumps({"status_code": r.status_code, "response": body}, indent=2))
 
-            if 200 <= resp.status_code < 300:
-                messages.append(f"✅ Dhan modify success for {r.get('name','')} ({oid})")
+            if r.status_code in (200, 201):
+                out.append(f"✅ Dhan modify ok for {it.get('name','')} ({oid})")
             else:
-                # show concise server error
-                et  = (body or {}).get("errorType")
-                ec  = (body or {}).get("errorCode")
-                em  = (body or {}).get("errorMessage") or (body or {}).get("message") or body
-                messages.append(f"❌ Dhan modify failed for {r.get('name','')} ({oid}): {et or ''} {ec or ''} {em}")
+                msg = (body.get("errorMessage") if isinstance(body, dict) else body)
+                out.append(f"❌ Dhan modify failed for {it.get('name','')} ({oid}): {msg}")
         except Exception as e:
-            messages.append(f"❌ Dhan modify failed for {r.get('name','')} ({oid}): {e}")
+            out.append(f"❌ Dhan modify exception for {it.get('name','')} ({oid}): {e}")
 
-    return {"message": messages}
-# ---------------------------------------------------------------------------
+    return {"message": out}
+
+
 
 
 
