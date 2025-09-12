@@ -694,110 +694,124 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-import json, requests
+# --- Dhan modify orders (drop-in) -------------------------------------------
+import os, json, requests
 
-DHAN_BASE = "https://api.dhan.co"
+DHAN_BASE = os.environ.get("DHAN_BASE", "https://api.dhan.co/v2")
 
-def modify_orders(rows: list[dict]) -> dict:
-    msgs: list[str] = []
+def _blank_or_str(x):
+    """Return '' for None/''/whitespace, else str(x) trimmed."""
+    if x is None:
+        return ""
+    s = str(x).strip()
+    return s if s else ""
 
-    for row in rows:
-        cj        = row.get("_client_json") or {}
-        token     = (cj.get("apikey")  or "").strip()
-        client_id = (cj.get("userid")  or "").strip()
-        oid       = str(row.get("order_id") or "").strip()
+def _infer_order_type(price_str: str, trig_str: str) -> str:
+    """
+    If UI sent NO_CHANGE (i.e., router gives us empty orderType),
+    infer a valid Dhan orderType so the API accepts the request.
+    """
+    has_price = bool(str(price_str).strip())
+    has_trig  = bool(str(trig_str).strip())
 
-        if not token or not client_id or not oid:
-            msgs.append(f"❌ Dhan modify skipped for {row.get('name','')}: missing token/clientId/order_id")
-            continue
+    if has_trig and not has_price:
+        return "STOP_LOSS_MARKET"
+    if has_trig and has_price:
+        return "STOP_LOSS"
+    if has_price and not has_trig:
+        return "LIMIT"
+    # Nothing changed → default to LIMIT so the request stays valid
+    return "LIMIT"
 
-        ot    = row.get("orderType")
-        price = row.get("price")
-        trig  = row.get("triggerPrice")
-        qty   = row.get("quantity")
-        discQ = row.get("disclosedQuantity") if row.get("disclosedQuantity") is not None else ""
+def modify_orders(rows):
+    """
+    rows: list of dicts from router, each like:
+      {
+        "name": "Edison wife",
+        "order_id": "952509127687",
+        "validity": "DAY",
+        "quantity": "",            # or number/string; blank => keep same
+        "price": "",               # "
+        "triggerPrice": "",        # "
+        "orderType": "",           # mapped or blank (NO_CHANGE)
+        "_client_json": { "userid": "...", "apikey": "..." }
+      }
+    """
+    messages = []
 
-        # infer type when user left 'NO_CHANGE'
-        def _num_or_none(v, cast=float):
-            try: return cast(v)
-            except Exception: return None
+    for r in rows or []:
+        cj   = (r.get("_client_json") or {})
+        dclid = _blank_or_str(cj.get("userid"))
+        token = _blank_or_str(cj.get("apikey"))
+        oid   = _blank_or_str(r.get("order_id"))
+        validity = (_blank_or_str(r.get("validity")) or "DAY").upper()
 
-        price = _num_or_none(price, float) if price not in ("", None) else None
-        trig  = _num_or_none(trig,  float) if trig  not in ("", None) else None
-        qty   = _num_or_none(qty,     int) if qty   not in ("", None) else None
+        # prepare all fields as strings (matches docs’ example format)
+        qty   = _blank_or_str(r.get("quantity"))
+        prc   = _blank_or_str(r.get("price"))
+        trig  = _blank_or_str(r.get("triggerPrice") or r.get("triggerprice"))
+        d_ot  = _blank_or_str(r.get("orderType"))  # may be blank (NO_CHANGE)
 
-        if not ot:
-            if trig is not None and price is not None: ot = "STOP_LOSS"
-            elif trig is not None:                    ot = "STOP_LOSS_MARKET"
-            elif price is not None:                   ot = "LIMIT"
+        if not d_ot:
+            d_ot = _infer_order_type(prc, trig)
 
-        # final validation (avoid DH-905)
-        if ot == "LIMIT":
-            if price is None:
-                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): LIMIT requires price.")
-                continue
-            trig = None
-        elif ot == "STOP_LOSS":
-            if price is None or trig is None:
-                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS needs price & triggerPrice.")
-                continue
-        elif ot == "STOP_LOSS_MARKET":
-            if trig is None:
-                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS_MARKET needs triggerPrice.")
-                continue
-            price = None
-        elif ot == "MARKET":
-            price = None; trig = None
-        else:
-            msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): orderType missing/invalid.")
-            continue
-
-        # ---- FULL DHAN REQUEST STRUCTURE
         payload = {
-            "dhanClientId": client_id,
-            "orderId": oid,
-            "orderType": ot,                     # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
-            "legName": "",
-            "quantity": qty if qty is not None else "",              # send key even if blank
-            "price": price if price is not None else "",
-            "disclosedQuantity": discQ if str(discQ) != "None" else "",
-            "triggerPrice": trig if trig is not None else "",
-            "validity": (row.get("validity") or "DAY").upper(),
+            "dhanClientId":       dclid,
+            "orderId":            oid,
+            "orderType":          d_ot,     # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
+            "legName":            "",       # keep empty unless you handle BO/CO legs
+            "quantity":           qty,      # keep blank to not change
+            "price":              prc,      # keep blank to not change
+            "disclosedQuantity":  _blank_or_str(r.get("disclosedQuantity")),  # usually blank
+            "triggerPrice":       trig,     # keep blank to not change
+            "validity":           validity  # DAY | IOC
         }
 
-        url = f"{DHAN_BASE}/v2/orders/{oid}"
-        headers = {"Content-Type": "application/json", "access-token": token}
+        url = f"{DHAN_BASE}/orders/{oid}"
+        headers = {
+            "Content-Type": "application/json",
+            "access-token": token,
+        }
 
-        # safe debug
+        # Safe debug (mask token)
         try:
-            safe_headers = {**headers, "access-token": "****"}
-            print("---- Dhan ModifyOrder (REQ) ----")
+            safe_headers = dict(headers)
+            if safe_headers.get("access-token"):
+                safe_headers["access-token"] = "****"
+            print("---- Dhan ModifyOrder (OUT) ----")
             print(json.dumps({"url": url, "headers": safe_headers, "payload": payload}, indent=2))
         except Exception:
             pass
 
         try:
-            resp = requests.put(url, json=payload, headers=headers, timeout=15)
+            resp = requests.put(url, headers=headers, json=payload, timeout=20)
             try:
                 body = resp.json()
             except Exception:
-                body = resp.text
+                body = {"text": resp.text}
 
             try:
                 print("---- Dhan ModifyOrder (RESP) ----")
-                print(json.dumps({"status_code": resp.status_code, "response": body}, indent=2))
+                safe_body = dict(body) if isinstance(body, dict) else body
+                print(json.dumps({"status_code": resp.status_code, "response": safe_body}, indent=2))
             except Exception:
                 pass
 
-            if resp.status_code in (200, 201) and isinstance(body, dict) and str(body.get("status","")).lower() == "success":
-                msgs.append(f"✅ Dhan modified order {oid} for {row.get('name','')}")
+            if 200 <= resp.status_code < 300:
+                messages.append(f"✅ Dhan modify success for {r.get('name','')} ({oid})")
             else:
-                err = body.get("errorMessage") if isinstance(body, dict) else body
-                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): {err}")
+                # show concise server error
+                et  = (body or {}).get("errorType")
+                ec  = (body or {}).get("errorCode")
+                em  = (body or {}).get("errorMessage") or (body or {}).get("message") or body
+                messages.append(f"❌ Dhan modify failed for {r.get('name','')} ({oid}): {et or ''} {ec or ''} {em}")
         except Exception as e:
-            msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): {e}")
+            messages.append(f"❌ Dhan modify failed for {r.get('name','')} ({oid}): {e}")
 
-    return {"message": msgs}
+    return {"message": messages}
+# ---------------------------------------------------------------------------
+
+
 
 
 
