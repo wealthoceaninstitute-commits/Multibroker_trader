@@ -68,18 +68,104 @@ def _needs_trigger(ot: str) -> bool:
 # ---------------------------
 # session / info
 # ---------------------------
-def login(client: Dict[str, Any]) -> bool:
+# ---------------------------
+# session / info  (upgraded)
+# ---------------------------
+from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    _IST = None  # fallback to naive datetimes
+
+def _parse_token_validity(ts: str):
+    """
+    tokenValidity examples seen from Dhan:
+      '19/09/2025 08:53'          (dd/MM/yyyy HH:mm)
+      '19/09/2025 08:53:00'
+      '19-09-2025 08:53'
+    Returns a datetime (IST if tz available) or None.
+    """
+    if not ts:
+        return None
+    ts = str(ts).strip()
+    fmts = ["%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S"]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(ts, fmt)
+            return dt.replace(tzinfo=_IST) if _IST else dt
+        except Exception:
+            continue
+    return None
+
+def login(client: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns a dict so the caller can persist/show warnings, but remains truthy.
+    Shape:
+      {
+        "ok": bool,
+        "token_validity_raw": "...",
+        "token_validity_iso": "...",
+        "token_days_left": int|None,
+        "token_warning": bool,
+        "message": "..."   # only when warning
+      }
+    """
     token = (client.get("apikey") or client.get("access_token") or "").strip()
     if not token:
-        return False
+        return {"ok": False, "message": "Missing access token"}
+
+    name = client.get("name") or client.get("display_name") or ""
+    uid  = str(client.get("userid") or client.get("client_id") or "").strip()
+
     try:
-        r = requests.get("https://api.dhan.co/v2/profile",
-                         headers={"access-token": token}, timeout=15)
-        print("[DHAN] /v2/profile ->", r.status_code)
-        return r.status_code == 200
+        r = requests.get(
+            "https://api.dhan.co/v2/profile",
+            headers={"access-token": token},
+            timeout=15
+        )
+        ok = (r.status_code == 200)
+        body = {}
+        try:
+            body = r.json() if r.content else {}
+        except Exception:
+            body = {}
+
+        # Parse tokenValidity (if present)
+        tv_raw = str(body.get("tokenValidity") or body.get("tokenvalidity") or "").strip()
+        tv_dt  = _parse_token_validity(tv_raw)
+        now    = datetime.now(_IST) if _IST else datetime.now()
+
+        days_left = None
+        warn = False
+        msg = ""
+
+        if tv_dt:
+            seconds_left = (tv_dt - now).total_seconds()
+            days_left = max(0, int(seconds_left // 86400))
+            warn = seconds_left <= 2 * 86400  # <= 2 days
+            if warn:
+                msg = (f"⚠️ Dhan token for {name or uid} expires in "
+                       f"{days_left} day(s) on {tv_raw}. Please regenerate a new token.")
+
+                # Also log to console for immediate visibility
+                try:
+                    print(f"[DHAN] {msg}")
+                except Exception:
+                    pass
+
+        return {
+            "ok": ok,
+            "token_validity_raw": tv_raw,
+            "token_validity_iso": (tv_dt.isoformat() if tv_dt else ""),
+            "token_days_left": days_left,
+            "token_warning": warn,
+            "message": msg
+        }
+
     except Exception as e:
-        print("[DHAN] login error:", e)
-        return False
+        return {"ok": False, "message": f"Dhan /v2/profile error: {e}"}
+
 
 
 def get_orders() -> Dict[str, List[Dict[str, Any]]]:
@@ -771,6 +857,7 @@ def modify_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
             messages.append(f"❌ {row.get('name','<unknown>')} ({row.get('order_id','?')}): {e}")
 
     return {"message": messages}
+
 
 
 
