@@ -1691,83 +1691,74 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 def route_modify_order(payload: Dict[str, Any] = Body(...)):
     """
     Modify pending orders (Dhan + Motilal).
+
     Accepts either:
       { "orders":[{...},{...}], ... }  OR  { "order":{...}, ... }
 
-    Dhan payload we pass to Broker_dhan.modify_orders will ALWAYS include:
-      dhanClientId, orderId, orderType, legName, quantity, price,
-      disclosedQuantity, triggerPrice, validity
+    Notes
+    -----
+    • We accept NO_CHANGE and auto-infer orderType from Price/Trigger when user filled them.
+    • For Dhan we attach the client's JSON (_client_json) so the broker layer can call the API.
+    • Prints verbose logs to STDOUT (visible in Railway → Logs).
     """
-    import json
+    import json, importlib
 
-    def _to_int_or_none(x):
+    def _i(x):
         try:
             s = str(x).strip()
             return None if s == "" else int(float(s))
         except Exception:
             return None
 
-    def _to_float_or_none(x):
+    def _f(x):
         try:
             s = str(x).strip()
             return None if s == "" else float(s)
         except Exception:
             return None
 
-    # ----- accept single 'order' or 'orders' list
+    # ---------- normalize inbound ----------
     orders = payload.get("orders")
     if not orders and payload.get("order"):
         orders = [payload["order"]]
     if not isinstance(orders, list) or not orders:
         raise HTTPException(status_code=400, detail="No orders provided.")
 
-    # top-level overrides (apply to all if per-order missing)
-    qty_default  = _to_int_or_none(payload.get("quantity"))
-    prc_default  = _to_float_or_none(payload.get("price"))
-    trg_default  = _to_float_or_none(payload.get("triggerprice") or payload.get("trig_price"))
-    ot_default   = (payload.get("orderType") or payload.get("ordertype") or "NO_CHANGE").upper().strip()
-    validity     = (payload.get("validity") or payload.get("timeForce") or "DAY").upper().strip()
+    # top-level defaults (apply when a row omits a field)
+    qty_default = _i(payload.get("quantity"))
+    prc_default = _f(payload.get("price"))
+    trg_default = _f(payload.get("triggerprice") or payload.get("trig_price"))
+    ot_default  = (payload.get("orderType") or payload.get("ordertype") or "NO_CHANGE").upper().replace("-", "_")
+    validity    = (payload.get("validity") or payload.get("timeForce") or "DAY").upper()
 
-    # map UI / guesses -> Dhan enums
-    def _map_ui_to_dhan(ot_ui: str) -> str | None:
-        m = {
-            "LIMIT": "LIMIT",
-            "MARKET": "MARKET",
-            "STOPLOSS": "STOP_LOSS",          # UI "STOPLOSS" -> Dhan "STOP_LOSS"
-            "SL_LIMIT": "STOP_LOSS",
-            "SL-MARKET": "STOP_LOSS_MARKET",
-            "SL_MARKET": "STOP_LOSS_MARKET",
-            "STOPLOSS_MARKET": "STOP_LOSS_MARKET",
-            "NO_CHANGE": None,
-            "": None
-        }
-        return m.get((ot_ui or "").upper(), None)
+    # mapping: UI → Dhan enums (when explicit)
+    def _map_ui_to_dhan(ot_ui: str | None) -> str | None:
+        if not ot_ui:
+            return None
+        u = str(ot_ui).upper().replace("-", "_")
+        if u in ("LIMIT", "MARKET"):
+            return u
+        if u in ("STOPLOSS", "STOP_LOSS", "SL", "SL_LIMIT", "STOPLOSS_LIMIT"):
+            return "STOP_LOSS"
+        if u in ("SL_MARKET", "STOPLOSS_MARKET", "STOP_LOSS_MARKET"):
+            return "STOP_LOSS_MARKET"
+        if u in ("NO_CHANGE", ""):
+            return None
+        return u  # passthrough
 
-    def _guess_dhan_type(price, trig) -> str:
-        """Infer Dhan orderType when user chose NO_CHANGE and we lack the original."""
+    # guess Dhan type if user chose NO_CHANGE but typed price/trigger
+    def _guess_type_from_values(price, trig) -> str:
         has_p = price is not None and str(price) != ""
         has_t = trig  is not None and str(trig)  != ""
         if has_t and has_p:
-            return "STOP_LOSS"           # SL-L
+            return "STOP_LOSS"            # SL-L
         if has_t and not has_p:
-            return "STOP_LOSS_MARKET"    # SL-M
+            return "STOP_LOSS_MARKET"     # SL-M
         if has_p and not has_t:
             return "LIMIT"
-        return "MARKET"                  # last resort
+        return "MARKET"
 
-    # small helper to find which broker a name belongs to
-    def _guess_broker_from_order(od: Dict[str, Any]) -> str | None:
-        oid = str((od or {}).get("order_id", "")).strip()
-        if oid.isdigit():           # Dhan IDs are numeric
-            return "dhan"
-        if any(c.isalpha() for c in oid):
-            return "motilal"
-        return _broker_by_client_name((od or {}).get("name"))  # fallback
-
-    # bucket orders by broker and include per-order fields
-    by_broker = {"dhan": [], "motilal": []}
-
-    # Load client JSON for dhan name
+    # small helper to load a client's json by display name
     def _load_client_json(broker: str, name: str) -> Dict[str, Any] | None:
         folder = DHAN_DIR if broker == "dhan" else MO_DIR
         needle = (name or "").strip().lower()
@@ -1783,34 +1774,66 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
                     return cj
         except FileNotFoundError:
             return None
+        except Exception:
+            return None
         return None
 
-    # build rows
+    # ---------- build broker buckets ----------
+    by_broker: Dict[str, List[Dict[str, Any]]] = {"dhan": [], "motilal": []}
+    skipped: List[str] = []
+
     for od in orders:
         name = (od or {}).get("name", "")
-        oid  = (od or {}).get("order_id", "")
-        brk  = _guess_broker_from_order(od) or _broker_by_client_name(name)
-        if brk not in by_broker:
+        oid  = str((od or {}).get("order_id") or (od or {}).get("orderId") or "").strip()
+        if not oid:
+            skipped.append(f"{name or '<unknown>'}: missing order_id")
             continue
 
-        # per-order values (fall back to top-level)
-        q   = _to_int_or_none(od.get("quantity"));            q   = q   if q   is not None else qty_default
-        p   = _to_float_or_none(od.get("price"));             p   = p   if p   is not None else prc_default
-        trg = _to_float_or_none(od.get("triggerprice") or od.get("triggerPrice"))
+        # pick broker: orderId digits → Dhan; alpha → Motilal; else fall back to name lookup
+        brk = _guess_broker_from_order(od) or _broker_by_client_name(name)
+        if brk not in by_broker:
+            skipped.append(f"{name} ({oid}): unknown broker")
+            continue
+
+        # row-level values (fallback to top-level defaults)
+        q   = _i(od.get("quantity"));            q   = q   if q   is not None else qty_default
+        p   = _f(od.get("price"));               p   = p   if p   is not None else prc_default
+        trg = _f(od.get("triggerprice") or od.get("triggerPrice"))
         trg = trg if trg is not None else trg_default
 
-        # UI or per-order orderType
-        ot_ui = (od.get("orderType") or od.get("ordertype") or ot_default or "").upper()
-        ot_dhan = _map_ui_to_dhan(ot_ui) or _guess_dhan_type(p, trg)
+        ot_ui    = (od.get("orderType") or od.get("ordertype") or ot_default or "").upper()
+        ot_dhan  = _map_ui_to_dhan(ot_ui)  # None if NO_CHANGE
+        # If still None and user typed values, give the broker layer a strong hint
+        mapped_guess = _guess_type_from_values(p, trg) if ot_dhan is None else ot_dhan
+
+        # Validate obvious impossible combos **only if** user explicitly chose a type.
+        # (When NO_CHANGE we let the broker layer fetch current order & decide.)
+        def _bad_combo() -> str | None:
+            if ot_dhan == "LIMIT" and (p is None or p <= 0):
+                return "LIMIT requires Price > 0"
+            if ot_dhan == "STOP_LOSS" and ((p is None or p <= 0) or (trg is None or trg <= 0)):
+                return "STOPLOSS requires both Price and Trigger > 0"
+            if ot_dhan == "STOP_LOSS_MARKET" and (trg is None or trg <= 0):
+                return "SL-MARKET requires Trigger > 0"
+            if q is not None and q <= 0:
+                return "Quantity must be a positive integer"
+            return None
+
+        err = _bad_combo()
+        if err:
+            skipped.append(f"{name} ({oid}): {err}")
+            continue
 
         row = {
             "name": name,
-            "order_id": str(oid),
-            "validity": validity or "DAY",
+            "order_id": oid,
+            "validity": (od.get("validity") or validity or "DAY").upper(),
             "quantity": q,
             "price": p,
             "triggerPrice": trg,
-            "orderType": ot_dhan,   # always a valid Dhan enum now
+            # Pass both: raw UI choice and our mapped guess (broker layer will resolve)
+            "orderType": ot_ui,
+            "orderType_in": mapped_guess,
         }
 
         if brk == "dhan":
@@ -1820,38 +1843,40 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
         else:
             by_broker["motilal"].append(row)
 
-    # ---- dispatch
-    messages: list[str] = []
+    # ---------- logs ----------
+    try:
+        print("\n[/modify_order] INBOUND =>")
+        print(json.dumps(payload, indent=2, default=str))
+        print("\n[/modify_order] DHAN bucket =>")
+        print(json.dumps(by_broker["dhan"], indent=2, default=str))
+        print("\n[/modify_order] MOTILAL bucket =>")
+        print(json.dumps(by_broker["motilal"], indent=2, default=str))
+        if skipped:
+            print("\n[/modify_order] SKIPPED =>")
+            print(json.dumps(skipped, indent=2, default=str))
+    except Exception:
+        pass
 
+    # ---------- dispatch to brokers ----------
+    messages: List[str] = []
+    if skipped:
+        messages.extend([f"ℹ️ {s}" for s in skipped])
+
+    # Dhan
     if by_broker["dhan"]:
         try:
             dh = importlib.import_module("Broker_dhan")
+            res = None
             if hasattr(dh, "modify_orders") and callable(getattr(dh, "modify_orders")):
                 res = dh.modify_orders(by_broker["dhan"])
-                if isinstance(res, dict) and isinstance(res.get("message"), list):
-                    messages.extend([str(x) for x in res["message"]])
-                else:
-                    messages.append(str(res))
+            elif hasattr(dh, "Broker_dhan"):
+                res = getattr(dh, "Broker_dhan")().modify_orders(by_broker["dhan"])
             else:
                 messages.append("❌ Broker_dhan.modify_orders not implemented")
-        except Exception as e:
-            messages.append(f"❌ dhan modify failed: {e}")
 
-    if by_broker["motilal"]:
-        try:
-            mo = importlib.import_module("Broker_motilal")
-            if hasattr(mo, "modify_orders") and callable(getattr(mo, "modify_orders")):
-                res = mo.modify_orders(by_broker["motilal"])
-                if isinstance(res, dict) and isinstance(res.get("message"), list):
-                    messages.extend([str(x) for x in res["message"]])
-                else:
-                    messages.append(str(res))
-            else:
-                messages.append("❌ Broker_motilal.modify_orders not implemented")
-        except Exception as e:
-            messages.append(f"❌ motilal modify failed: {e}")
+            try:
+                print("\n[/modi]()
 
-    return {"message": messages}
 
 
 
@@ -1859,6 +1884,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
