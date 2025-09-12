@@ -694,174 +694,118 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-def modify_orders(orders):
-    """
-    DHAN: modify multiple pending orders.
+# Broker_dhan.py
+import json
+import requests
+from typing import Dict, List, Any
 
-    Each item in `orders` should look like:
-    {
-      "name": "Edison wife",
-      "order_id": "952509127687",
-      "orderType": "LIMIT|MARKET|STOPLOSS|SL_LIMIT|SL_MARKET|NO_CHANGE" (optional),
-      "quantity": 40 (optional),
-      "price": 3345.8 (optional),
-      "triggerPrice": 3340.0 (optional),
-      "validity": "DAY|IOC" (optional),
-      "_client_json": { "userid": "...", "apikey": "..." }  # router may pass this
+DHAN_BASE = "https://api.dhan.co/v2"
+
+def _mask(tok: str) -> str:
+    if not tok:
+        return "****"
+    return tok[:3] + "****" + tok[-3:]
+
+def _headers(token: str) -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "access-token": token or ""
     }
 
-    Returns: {"message": [str, ...]}
+def _fetch_order_type_if_missing(token: str, order_id: str) -> str | None:
+    """Fallback: read current orderType from Dhan to reuse when user left type as NO_CHANGE."""
+    try:
+        url = f"{DHAN_BASE}/orders/{order_id}"
+        r = requests.get(url, headers=_headers(token), timeout=10)
+        if r.status_code == 200:
+            data = r.json() or {}
+            ot = (data.get("orderType") or "").strip()
+            return ot or None
+    except Exception:
+        pass
+    return None
+
+def modify_orders(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    import os, json, requests
+    rows: [
+      {
+        "name": "...",
+        "order_id": "...",
+        "validity": "DAY",
+        "orderType"?: "LIMIT|MARKET|STOP_LOSS|STOP_LOSS_MARKET",
+        "quantity"?: int,
+        "price"?: float,
+        "triggerPrice"?: float,
+        "_client_json": { "userid": "...", "apikey": "..." }
+      },
+      ...
+    ]
+    """
+    messages: List[str] = []
 
-    messages = []
+    for r in rows:
+        name = r.get("name", "")
+        oid  = str(r.get("order_id", "")).strip()
+        cj   = r.get("_client_json") or {}
+        token     = (cj.get("apikey") or "").strip()
+        client_id = (cj.get("userid") or cj.get("client_id") or "").strip()
 
-    def _load_client_json_by_name(name: str):
-        base = os.path.abspath(os.environ.get("DATA_DIR", "./data"))
-        dhan_dir = os.path.join(base, "clients", "dhan")
-        needle = (name or "").strip().lower()
-        try:
-            for fn in os.listdir(dhan_dir):
-                if not fn.endswith(".json"):
-                    continue
-                p = os.path.join(dhan_dir, fn)
-                with open(p, "r", encoding="utf-8") as f:
-                    cj = json.load(f)
-                nm = (cj.get("name") or cj.get("display_name") or "").strip().lower()
-                if nm == needle:
-                    return cj
-        except FileNotFoundError:
-            pass
-        return None
-
-    def _map_order_type(ot, price, trig):
-        m = {
-            "LIMIT": "LIMIT",
-            "MARKET": "MARKET",
-            "STOPLOSS": "STOPLOSS_LIMIT",
-            "SL_LIMIT": "STOPLOSS_LIMIT",
-            "SL-MARKET": "STOPLOSS_MARKET",
-            "SL_MARKET": "STOPLOSS_MARKET",
-            "STOPLOSS_MARKET": "STOPLOSS_MARKET",
-            "NO_CHANGE": None,
-            "": None,
-            None: None,
-        }
-        ot = (ot or "").strip().upper()
-        mapped = m.get(ot, None)
-        if mapped is None:
-            # Fallback inference to help avoid DH-905 when UI didn't pass orderType
-            if trig is not None and price is not None:
-                mapped = "STOPLOSS_LIMIT"
-            elif trig is not None and price is None:
-                mapped = "STOPLOSS_MARKET"
-            elif price is not None and trig is None:
-                mapped = "LIMIT"
-        return mapped
-
-    def _to_int_or_none(x):
-        try:
-            s = str(x).strip()
-            return None if s == "" else int(float(s))
-        except Exception:
-            return None
-
-    def _to_float_or_none(x):
-        try:
-            s = str(x).strip()
-            return None if s == "" else float(s)
-        except Exception:
-            return None
-
-    for od in (orders or []):
-        name     = (od or {}).get("name", "")
-        order_id = str((od or {}).get("order_id", "")).strip()
-
-        # pull client creds (from router or disk)
-        cj = (od or {}).get("_client_json") or _load_client_json_by_name(name) or {}
-        dhan_client_id = str(cj.get("userid") or cj.get("client_id") or "").strip()
-        access_token   = str(cj.get("apikey") or "").strip()
-
-        if not access_token or not dhan_client_id or not order_id:
-            messages.append(f"❌ Dhan modify: missing creds or order_id for {name}")
+        if not (oid and token and client_id):
+            messages.append(f"❌ Dhan modify failed for {name} ({oid}): missing token/client_id")
             continue
 
-        qty   = _to_int_or_none(od.get("quantity"))
-        prc   = _to_float_or_none(od.get("price"))
-        trig  = _to_float_or_none(od.get("triggerPrice") or od.get("triggerprice"))
-        disc  = _to_int_or_none(od.get("disclosedQuantity") or od.get("disclosedquantity"))
-        valid = (od.get("validity") or "DAY").strip().upper() or "DAY"
+        order_type = (r.get("orderType") or "").strip()
+        if not order_type:
+            order_type = _fetch_order_type_if_missing(token, oid)
 
-        mapped_ot = _map_order_type(od.get("orderType") or od.get("ordertype"), prc, trig)
-
-        # Build DHAN payload – include ONLY fields we are changing
-        payload = {
-            "dhanClientId": dhan_client_id,
-            "orderId": order_id,  # keep in body as well (in addition to path)
-            "validity": valid,
+        payload: Dict[str, Any] = {
+            "dhanClientId": client_id,
+            "orderId": oid,
+            "validity": r.get("validity", "DAY"),
+            "orderType": order_type,      # Dhan requires this
+            "legName": ""
         }
-        if mapped_ot:
-            payload["orderType"] = mapped_ot
-        if qty is not None:
-            payload["quantity"] = str(qty)
-        if prc is not None:
-            payload["price"] = str(prc)
-        if trig is not None:
-            payload["triggerPrice"] = str(trig)
-        if disc is not None:
-            payload["disclosedQuantity"] = str(disc)
-        # Optional field accepted by API; leave empty string if not known
-        payload["legName"] = str(od.get("legName", "") or "")
+        if r.get("quantity") is not None:
+            payload["quantity"] = int(r["quantity"])
+        if r.get("price") is not None:
+            payload["price"] = float(r["price"])          # numeric
+        if r.get("triggerPrice") is not None:
+            payload["triggerPrice"] = float(r["triggerPrice"])
 
-        url = f"https://api.dhan.co/v2/orders/{order_id}"
-        headers = {
-            "Content-Type": "application/json",
-            "access-token": access_token,
-        }
+        url = f"{DHAN_BASE}/orders/{oid}"
 
-        # --- Verbose logging to help debug (token masked in log)
+        # ---- safe debug log
         try:
-            print("---- Dhan ModifyOrder (IN) ----")
-            print(json.dumps({
-                "name": name, "order_id": order_id,
-                "quantity": qty, "price": prc, "triggerprice": trig,
-                "orderType_in": od.get("orderType") or od.get("ordertype"),
-                "mapped_orderType": mapped_ot,
-                "validity": valid
-            }, indent=2, default=str))
             print("---- Dhan ModifyOrder (OUT) ----")
             print(json.dumps({
                 "url": url,
-                "headers": {"Content-Type": "application/json", "access-token": "****"},
+                "headers": {"Content-Type": "application/json", "access-token": _mask(token)},
                 "payload": payload
             }, indent=2, default=str))
         except Exception:
             pass
 
         try:
-            resp = requests.put(url, headers=headers, json=payload, timeout=20)
-            body = {}
+            resp = requests.put(url, headers=_headers(token), json=payload, timeout=15)
+            status = resp.status_code
             try:
-                body = resp.json() if resp.text else {}
+                body = resp.json()
             except Exception:
-                body = {"raw": resp.text}
+                body = {"text": resp.text}
 
-            try:
-                print("---- Dhan ModifyOrder (RESP) ----")
-                print(json.dumps({"status_code": resp.status_code, "response": body}, indent=2, default=str))
-            except Exception:
-                pass
+            print("---- Dhan ModifyOrder (RESP) ----")
+            print(json.dumps({"status_code": status, "response": body}, indent=2, default=str))
 
-            ok = (resp.status_code == 200) and (str(body.get("status", "")).lower() in ("success", "ok", "true") or not body.get("errorCode"))
-            if ok:
-                messages.append(f"✅ Dhan modified {order_id} for {name}")
+            if 200 <= status < 300:
+                messages.append(f"✅ Dhan modify OK for {name} ({oid})")
             else:
-                err = body.get("errorMessage") or body.get("message") or body.get("raw") or f"HTTP {resp.status_code}"
-                messages.append(f"❌ Dhan modify failed for {name} ({order_id}): {err}")
+                msg = body.get("errorMessage") if isinstance(body, dict) else body
+                messages.append(f"❌ Dhan modify failed for {name} ({oid}): {msg}")
         except Exception as e:
-            messages.append(f"❌ Dhan modify exception for {name} ({order_id}): {e}")
+            messages.append(f"❌ Dhan modify failed for {name} ({oid}): {e}")
 
     return {"message": messages}
+
 
 
 
