@@ -761,7 +761,71 @@ def _build_dhan_modify_payload(row: dict) -> dict:
     # (omit legName unless you have a real value)
     return payload
 
+    def modify_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Batch modify for Dhan.
+    Expects each row to include:
+      name, order_id, orderType (LIMIT|MARKET|STOP_LOSS|STOP_LOSS_MARKET),
+      price?, triggerPrice?, quantity?, validity?, disclosedQuantity?, _client_json{apikey, userid}
+    """
+    messages: List[str] = []
+
+    for row in (orders or []):
+        try:
+            name = (row.get("name") or "").strip()
+            order_id = str(row.get("order_id") or row.get("orderId") or "").strip()
+            cj = row.get("_client_json") or {}
+            token = (cj.get("apikey") or cj.get("access_token") or "").strip()
+
+            if not order_id or not token or not (cj.get("userid") or cj.get("client_id")):
+                messages.append(f"❌ {name or '<unknown>'}: missing order_id/client/token")
+                continue
+
+            # Build clean payload (ints/floats, disclosedQuantity=0, no empty strings)
+            payload = _build_dhan_modify_payload(row)
+
+            url = f"https://api.dhan.co/v2/orders/{order_id}"
+            headers = {"Content-Type": "application/json", "access-token": token}
+
+            # DEBUG (nice to keep while verifying)
+            try:
+                print("---- Dhan ModifyOrder (OUT) ----")
+                print({"url": url, "headers": {"access-token": f"{token[:6]}...{token[-4:]}"},
+                       "payload": payload})
+            except Exception:
+                pass
+
+            r = requests.put(url, headers=headers, json=payload, timeout=20)
+            try:
+                body = r.json() if r.content else {}
+            except Exception:
+                body = {"raw": getattr(r, "text", "")}
+
+            # DEBUG
+            try:
+                print("---- Dhan ModifyOrder (RESP) ----")
+                print({"status_code": r.status_code, "response": body})
+            except Exception:
+                pass
+
+            err = ""
+            if isinstance(body, dict):
+                err = body.get("errorMessage") or body.get("message") or ""
+            ok = (200 <= r.status_code < 300) and not body.get("errorType", "")
+
+            if ok:
+                messages.append(f"✅ {name} ({order_id}): Modified")
+            else:
+                messages.append(f"❌ {name} ({order_id}): {err or ('HTTP ' + str(r.status_code))}")
+
+        except Exception as e:
+            messages.append(f"❌ modify failed: {e}")
+
     return {"message": messages}
+
+
+    return {"message": messages}
+
 
 
 
