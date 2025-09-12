@@ -599,110 +599,46 @@ def place_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {"status": "completed", "order_responses": responses}
 
-# --- Dhan: single-order modify helper (PUT /v2/orders/{orderId}) ---
-def modify_order_dhan(
-    client: dict,
-    order_id: str,
-    quantity: int | None = None,
-    price: float | None = None,
-    triggerprice: float | None = None,
-    ordertype: str | None = None,   # LIMIT | MARKET | STOPLOSS | STOPLOSS_MARKET | SL | SL-M | ...
-    validity: str | None = None,    # DAY | IOC
-    disclosedqty: int | None = None,
-    leg_name: str = ""              # optional, keep empty for regular orders
-) -> dict:
+from typing import Dict, Any, List
+import requests
+import json
+
+def _build_dhan_modify_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls Dhan v2 'Order Modification' API.
-    Requires client to contain:
-      client['userid'] -> dhanClientId
-      client['apikey'] -> access-token (JWT)
+    Build a clean Dhan modify payload:
+    - ints/floats stay numeric (no quotes)
+    - disclosedQuantity is always 0 (never "")
+    - omit fields that are blank/zero so Dhan treats them as unchanged
     """
-    import requests, json
-
-    def _map_ot(ot: str | None) -> str | None:
-        if not ot:
-            return None
-        s = str(ot).strip().upper().replace("_", " ")
-        if s in ("SL-M", "SL M", "SL MARKET", "STOPLOSS MARKET", "STOP LOSS MARKET"):
-            return "STOP LOSS MARKET"
-        if s in ("SL", "STOPLOSS", "STOP LOSS", "STOP LOSS LIMIT"):
-            return "STOP LOSS"
-        if s in ("LIMIT", "MARKET"):
-            return s
-        return s  # passthrough
-
-    dhan_client_id = str(client.get("userid") or client.get("client_id") or "").strip()
-    token = (client.get("apikey") or "").strip()
-    if not dhan_client_id or not token:
-        return {"status": "error", "message": "Missing dhanClientId or access token in client JSON."}
-    if not str(order_id).strip():
-        return {"status": "error", "message": "order_id is required"}
-
-    ot = _map_ot(ordertype)
-
-    # Validation according to Dhan semantics
-    if ot == "LIMIT" and (price is None or float(price) <= 0):
-        return {"status": "error", "message": "Price must be > 0 for LIMIT orders."}
-    if ot == "STOP LOSS" and (price is None or float(price) <= 0 or triggerprice is None or float(triggerprice) <= 0):
-        return {"status": "error", "message": "Both price and triggerPrice are required for STOP LOSS orders."}
-    if ot == "STOP LOSS MARKET" and (triggerprice is None or float(triggerprice) <= 0):
-        return {"status": "error", "message": "triggerPrice is required for STOP LOSS MARKET orders."}
-    if quantity is not None and int(quantity) <= 0:
-        return {"status": "error", "message": "Quantity must be a positive integer."}
-
-    # Build request payload — only include fields that are actually being changed
-    payload: dict = {
-        "dhanClientId": dhan_client_id,
-        "orderId": str(order_id),
-    }
-    if ot:                   payload["orderType"]         = ot
-    if leg_name is not None: payload["legName"]           = leg_name
-    if quantity is not None: payload["quantity"]          = str(int(quantity))
-    if price is not None:    payload["price"]             = str(float(price))
-    if disclosedqty is not None:
-                             payload["disclosedQuantity"] = str(int(disclosedqty))
-    if triggerprice is not None:
-                             payload["triggerPrice"]      = str(float(triggerprice))
-    if validity:             payload["validity"]          = str(validity).upper()
-
-    url = f"https://api.dhan.co/v2/orders/{order_id}"
-    headers = {
-        "Content-Type": "application/json",
-        "access-token": token,  # Dhan JWT
-    }
-
-    try:
-        resp = requests.put(url, headers=headers, json=payload, timeout=20)
-        # Dhan returns JSON with status/message; propagate along with HTTP code
+    def _has_value(x) -> bool:
+        if x is None:
+            return False
+        if isinstance(x, str):
+            s = x.strip()
+            return s not in ("", "0", "0.0")
         try:
-            body = resp.json()
+            return float(x) != 0
         except Exception:
-            body = {"raw": resp.text}
-        if 200 <= resp.status_code < 300:
-            # normalize success shape
-            if isinstance(body, dict):
-                body.setdefault("http_status", resp.status_code)
-                body.setdefault("status", body.get("status") or "success")
-            return body
-        return {
-            "status": "error",
-            "http_status": resp.status_code,
-            "message": (body.get("message") if isinstance(body, dict) else body),
-            "response": body,
-        }
-    except Exception as e:
-        return {"status": "error", "message": f"Dhan modify call failed: {e}"}
+            return True
 
+    def _infer_type_local(price, trig) -> str:
+        has_p = _has_value(price)
+        has_t = _has_value(trig)
+        if has_t and has_p:
+            return "STOP_LOSS"            # SL-L
+        if has_t and not has_p:
+            return "STOP_LOSS_MARKET"     # SL-M
+        if has_p and not has_t:
+            return "LIMIT"
+        return "MARKET"
 
-# --- SIMPLE MODULE-LEVEL MODIFY for DHAN -----------------------------
-from collections import OrderedDict
-from typing import List, Dict, Any
-import requests, json
+    cj   = (row.get("_client_json") or {})
+    price = row.get("price")
+    trig  = row.get("triggerPrice") if "triggerPrice" in row else row.get("triggerprice")
 
-def _map_ui_to_dhan(ot: str | None) -> str | None:
-    if not ot: return None
-    u = str(ot).strip().upper().replace("-", "_")
-    m = {
+    # Normalize orderType (fallback: infer from provided values)
+    ot_in  = (row.get("orderType") or "").strip().upper().replace("-", "_")
+    ot_map = {
         "LIMIT": "LIMIT",
         "MARKET": "MARKET",
         "STOPLOSS": "STOP_LOSS",
@@ -712,57 +648,131 @@ def _map_ui_to_dhan(ot: str | None) -> str | None:
         "SL_MARKET": "STOP_LOSS_MARKET",
         "STOP_LOSS_MARKET": "STOP_LOSS_MARKET",
         "STOPLOSS_MARKET": "STOP_LOSS_MARKET",
-        "NO_CHANGE": None,
-        "UNCHANGED": None,
-        "": None,
+        "NO_CHANGE": "",
+        "": "",
     }
-    return m.get(u, None)
+    order_type = ot_map.get(ot_in, ot_in) or _infer_type_local(price, trig)
 
-def _infer_type(price, trig) -> str:
-    has_p = (price not in (None, "")) and float(price) > 0
-    has_t = (trig  not in (None, "")) and float(trig)  > 0
-    if has_t and has_p:  return "STOP_LOSS"          # SL-L
-    if has_t and not has_p: return "STOP_LOSS_MARKET" # SL-M
-    if has_p and not has_t: return "LIMIT"
-    return "MARKET"
-
-def _s(v) -> str:
-    # serialize numbers as strings; blank if None/""
-    if v in (None, ""): return ""
-    return str(v)
-
-def _build_dhan_modify_payload(row: dict) -> dict:
-    # Required basics
-    payload = {
-        "dhanClientId": str(row["_client_json"]["userid"]),
-        "orderId": str(row["order_id"]),
-        "orderType": row["orderType"],                  # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
-        "validity": row.get("validity") or "DAY",
+    payload: Dict[str, Any] = {
+        "dhanClientId": str(cj.get("userid") or cj.get("client_id") or ""),
+        "orderId": str(row.get("order_id") or row.get("orderId") or ""),
+        "orderType": order_type,
+        "validity": str(row.get("validity") or "DAY").upper(),
+        "disclosedQuantity": 0,  # numeric 0, never ""
     }
 
-    # Only include fields that are actually set; keep numeric types
     q = row.get("quantity")
-    if q not in (None, ""):
-        payload["quantity"] = int(q)
+    if _has_value(q):
+        try:
+            payload["quantity"] = int(float(q))
+        except Exception:
+            pass
 
-    p = row.get("price")
-    if p not in (None, ""):
-        payload["price"] = float(p)
+    if _has_value(price):
+        try:
+            payload["price"] = float(price)
+        except Exception:
+            pass
 
-    tp = row.get("triggerPrice")
-    if tp not in (None, ""):
-        payload["triggerPrice"] = float(tp)
+    if _has_value(trig):
+        try:
+            payload["triggerPrice"] = float(trig)
+        except Exception:
+            pass
 
-    # Disclosed quantity must be an int; default to 0 (never "")
-    dq = row.get("disclosedQuantity", 0)
-    payload["disclosedQuantity"] = 0 if dq in (None, "", 0) else int(dq)
+    # Only include legName if non-empty
+    leg = row.get("legName")
+    if isinstance(leg, str) and leg.strip():
+        payload["legName"] = leg.strip()
 
-    # Do NOT send empty strings like legName:""
-    # (omit legName unless you have a real value)
     return payload
 
-    
+
+def modify_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Batch modify Dhan orders.
+
+    Each row should contain:
+      name, order_id, orderType (or leave blank and provide price/trigger),
+      price?, triggerPrice?, quantity?, validity?, disclosedQuantity? (ignored -> always 0),
+      _client_json { userid, apikey|access_token }
+
+    Returns: {"message": [ "...", ... ]}
+    """
+    messages: List[str] = []
+
+    for row in (orders or []):
+        try:
+            name     = (row.get("name") or "").strip() or "<unknown>"
+            order_id = str(row.get("order_id") or row.get("orderId") or "").strip()
+            cj       = row.get("_client_json") or {}
+            token    = (cj.get("apikey") or cj.get("access_token") or "").strip()
+            dhan_id  = str(cj.get("userid") or cj.get("client_id") or "").strip()
+
+            if not order_id or not token or not dhan_id:
+                messages.append(f"❌ {name}: missing order_id/client/token")
+                continue
+
+            payload = _build_dhan_modify_payload(row)
+
+            # Basic validations for explicit types
+            ot = payload.get("orderType")
+            if ot == "LIMIT" and "price" not in payload:
+                messages.append(f"❌ {name} ({order_id}): LIMIT requires Price > 0")
+                continue
+            if ot == "STOP_LOSS" and not {"price", "triggerPrice"} <= payload.keys():
+                messages.append(f"❌ {name} ({order_id}): STOP_LOSS requires Price & Trigger > 0")
+                continue
+            if ot == "STOP_LOSS_MARKET" and "triggerPrice" not in payload:
+                messages.append(f"❌ {name} ({order_id}): SL-MARKET requires Trigger > 0")
+                continue
+            if payload.get("quantity", 1) <= 0:
+                payload.pop("quantity", None)  # don't send zero/negative qty
+
+            url = f"https://api.dhan.co/v2/orders/{order_id}"
+            headers = {"Content-Type": "application/json", "access-token": token}
+
+            # --- DEBUG OUT ---
+            try:
+                safe_token = f"{token[:6]}...{token[-4:]}"
+                print("---- Dhan ModifyOrder (OUT) ----")
+                print(json.dumps({
+                    "url": url,
+                    "headers": {"access-token": safe_token},
+                    "payload": payload
+                }, indent=2))
+            except Exception:
+                pass
+
+            r = requests.put(url, headers=headers, json=payload, timeout=20)
+            try:
+                body = r.json() if r.content else {}
+            except Exception:
+                body = {"raw": getattr(r, "text", "")}
+
+            # --- DEBUG RESP ---
+            try:
+                print("---- Dhan ModifyOrder (RESP) ----")
+                print(json.dumps({"status_code": r.status_code, "response": body}, indent=2))
+            except Exception:
+                pass
+
+            # Success heuristic: 2xx and no errorType
+            ok = (200 <= r.status_code < 300) and not (isinstance(body, dict) and body.get("errorType"))
+            if ok:
+                messages.append(f"✅ {name} ({order_id}): Modified")
+            else:
+                err = ""
+                if isinstance(body, dict):
+                    err = body.get("errorMessage") or body.get("message") or body.get("status") or ""
+                messages.append(f"❌ {name} ({order_id}): {err or ('HTTP ' + str(r.status_code))}")
+
+        except Exception as e:
+            messages.append(f"❌ {row.get('name','<unknown>')} ({row.get('order_id','?')}): {e}")
+
     return {"message": messages}
+
+
 
 
 
