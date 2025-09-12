@@ -731,80 +731,38 @@ def _s(v) -> str:
     if v in (None, ""): return ""
     return str(v)
 
-def modify_orders(items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-    """
-    items: [{ name, order_id, quantity?, price?, triggerPrice?, orderType?, validity?, _client_json:{userid, apikey} }, ...]
-    returns: {"message":[ "...", ... ]}
-    """
-    messages: List[str] = []
+def _build_dhan_modify_payload(row: dict) -> dict:
+    # Required basics
+    payload = {
+        "dhanClientId": str(row["_client_json"]["userid"]),
+        "orderId": str(row["order_id"]),
+        "orderType": row["orderType"],                  # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
+        "validity": row.get("validity") or "DAY",
+    }
 
-    for it in (items or []):
-        cj        = it.get("_client_json") or {}
-        token     = (cj.get("apikey") or cj.get("access_token") or "").strip()
-        dclid     = str(cj.get("userid") or cj.get("dhanClientId") or "").strip()
-        order_id  = str(it.get("order_id") or it.get("orderId") or "").strip()
-        name      = it.get("name") or dclid
+    # Only include fields that are actually set; keep numeric types
+    q = row.get("quantity")
+    if q not in (None, ""):
+        payload["quantity"] = int(q)
 
-        if not (token and dclid and order_id):
-            messages.append(f"❌ {name}: missing token/client/orderId")
-            continue
+    p = row.get("price")
+    if p not in (None, ""):
+        payload["price"] = float(p)
 
-        qty   = it.get("quantity")
-        prc   = it.get("price")
-        trig  = it.get("triggerPrice", it.get("triggerprice"))
-        vald  = (it.get("validity") or "DAY").upper()
+    tp = row.get("triggerPrice")
+    if tp not in (None, ""):
+        payload["triggerPrice"] = float(tp)
 
-        # choose orderType
-        ot    = _map_ui_to_dhan(it.get("orderType"))
-        if not ot:
-            ot = _infer_type(prc, trig)
+    # Disclosed quantity must be an int; default to 0 (never "")
+    dq = row.get("disclosedQuantity", 0)
+    payload["disclosedQuantity"] = 0 if dq in (None, "", 0) else int(dq)
 
-        # obey Dhan rules
-        if ot == "MARKET":
-            prc, trig = None, None
-        elif ot == "STOP_LOSS_MARKET":
-            prc = None  # SL-M must not send price
-
-        payload = OrderedDict([
-            ("dhanClientId", _s(dclid)),
-            ("orderId",      _s(order_id)),
-            ("orderType",    ot),
-            ("legName",      ""),
-            ("quantity",     _s(int(qty) if qty not in (None, "") else "")),
-            ("price",        _s(float(prc) if prc not in (None, "") else "")),
-            ("disclosedQuantity", ""),
-            ("triggerPrice", _s(float(trig) if trig not in (None, "") else "")),
-            ("validity",     vald),
-        ])
-
-        url = f"https://api.dhan.co/v2/orders/{order_id}"
-        headers = {"Content-Type": "application/json", "access-token": token}
-
-        # (optional) safe debug
-        try:
-            safe_tok = token[:6] + "..." + token[-4:]
-            print("\n---- Dhan ModifyOrder (OUT) ----")
-            print(json.dumps({"url": url, "headers": {"access-token": safe_tok}, "payload": payload}, indent=2))
-        except Exception:
-            pass
-
-        try:
-            r = requests.put(url, headers=headers, json=payload, timeout=15)
-            try:
-                body = r.json()
-            except Exception:
-                body = {"raw": r.text}
-
-            print("---- Dhan ModifyOrder (RESP) ----")
-            print(json.dumps({"status_code": r.status_code, "response": body}, indent=2))
-
-            ok = 200 <= r.status_code < 300
-            msg = (body.get("message") or body.get("errorMessage") or body) if isinstance(body, dict) else body
-            messages.append(f"{'✅' if ok else '❌'} {name} ({order_id}): {msg}")
-        except Exception as e:
-            messages.append(f"❌ {name} ({order_id}): {e}")
+    # Do NOT send empty strings like legName:""
+    # (omit legName unless you have a real value)
+    return payload
 
     return {"message": messages}
+
 
 
 
