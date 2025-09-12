@@ -1690,13 +1690,15 @@ def route_place_order_compat(payload: Dict[str, Any] = Body(...)):
 @app.post("/modify_order")
 def route_modify_order(payload: Dict[str, Any] = Body(...)):
     """
-    Normalize UI input, infer a valid Dhan orderType when user picked NO_CHANGE,
-    and send a clean broker-specific payload. Token is masked in logs.
-    Accepts: {"order": {...}} or {"orders":[...]} plus optional price/trigger/qty/orderType/validity.
+    Accepts:
+      { "order": {...} }  or  { "orders": [ {...}, ... ] }
+    where each {...} may contain:
+      name, symbol, order_id, quantity|qty, price, triggerprice|triggerPrice|trig_price,
+      orderType|ordertype, validity|timeForce
     """
     import json, importlib, os
 
-    # --- accept both single and batch shapes ---
+    # ---- normalize array of orders
     if isinstance(payload.get("orders"), list):
         raw_orders = payload["orders"]
     elif isinstance(payload.get("order"), dict):
@@ -1704,50 +1706,45 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
     else:
         raise HTTPException(status_code=400, detail="No orders provided.")
 
-    # top level modify fields (UI may put them here)
-    qty_in = payload.get("quantity", payload.get("qty", ""))
-    prc_in = payload.get("price", "")
-    trg_in = payload.get("triggerprice", payload.get("triggerPrice", payload.get("trig_price", "")))
-    ot_in  = payload.get("orderType", payload.get("ordertype", "")) or ""
-    val_in = (payload.get("validity") or payload.get("timeForce") or "DAY").upper()
+    def _pick(d: dict, *keys):
+        for k in keys:
+            if k in d and str(d[k]).strip() != "":
+                return d[k]
+        return None
 
     def _num_or_none(v, cast=float):
         try:
+            if v is None: return None
             s = str(v).strip()
-            if s == "":
-                return None
+            if s == "": return None
             return cast(s)
         except Exception:
             return None
 
-    qty  = _num_or_none(qty_in, int)
-    prc  = _num_or_none(prc_in, float)
-    trig = _num_or_none(trg_in, float)
-
+    # UI -> Dhan enum
     def _map_ui_to_dhan(ot: str | None, prc, trig) -> str | None:
-        """Map UI radios to Dhan. If NO_CHANGE, infer from provided fields."""
         if ot:
             o = ot.upper().replace("-", "_")
-            if o == "STOPLOSS":          return "STOP_LOSS"
-            if o == "SL_LIMIT":          return "STOP_LOSS"
-            if o == "SL_MARKET":         return "STOP_LOSS_MARKET"
-            if o in ("LIMIT","MARKET","STOP_LOSS","STOP_LOSS_MARKET"):
-                return o
-            if o in ("NO_CHANGE","UNCHANGED"):
-                ot = None  # fall through
-        # infer type from which fields were provided
+            if o == "STOPLOSS":      return "STOP_LOSS"
+            if o == "SL_LIMIT":      return "STOP_LOSS"
+            if o == "SL_MARKET":     return "STOP_LOSS_MARKET"
+            if o in ("LIMIT","MARKET","STOP_LOSS","STOP_LOSS_MARKET","NO_CHANGE"):
+                if o == "NO_CHANGE":
+                    ot = None
+                else:
+                    return o
+        # infer when NO_CHANGE but numbers changed
         if trig is not None and prc is not None:  return "STOP_LOSS"
         if trig is not None and prc is None:      return "STOP_LOSS_MARKET"
         if prc  is not None:                      return "LIMIT"
         return None
 
-    # load client json for dhan
+    # load client json for Dhan
     def _load_dhan_client_json(name: str) -> dict | None:
         needle = (name or "").strip().lower()
         try:
             for fn in os.listdir(DHAN_DIR):
-                if not fn.endswith(".json"):
-                    continue
+                if not fn.endswith(".json"): continue
                 p = os.path.join(DHAN_DIR, fn)
                 with open(p, "r", encoding="utf-8") as f:
                     cj = json.load(f)
@@ -1760,46 +1757,64 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 
     rows_dhan, rows_mo = [], []
 
+    # top-level fallbacks (kept for safety)
+    top_qty   = _pick(payload, "quantity", "qty")
+    top_prc   = _pick(payload, "price")
+    top_trig  = _pick(payload, "triggerprice", "triggerPrice", "trig_price")
+    top_ot    = _pick(payload, "orderType", "ordertype")
+    top_val   = (_pick(payload, "validity", "timeForce") or "DAY").upper()
+    top_discQ = _pick(payload, "disclosedQuantity", "disclosedquantity")
+
     for od in raw_orders:
-        name = (od or {}).get("name", "")
-        oid  = str((od or {}).get("order_id", "")).strip()
+        name = _pick(od, "name") or ""
+        oid  = str(_pick(od, "order_id") or "").strip()
         if not name or not oid:
+            # skip silently if malformed
             continue
 
-        # pick broker by order-id shape
+        # per-order values with top-level fallback
+        qty   = _num_or_none(_pick(od, "quantity", "qty") or top_qty, int)
+        prc   = _num_or_none(_pick(od, "price") or top_prc, float)
+        trig  = _num_or_none(_pick(od, "triggerprice", "triggerPrice", "trig_price") or top_trig, float)
+        ot_in = _pick(od, "orderType", "ordertype") or top_ot
+        val   = (_pick(od, "validity", "timeForce") or top_val).upper()
+        discQ = _pick(od, "disclosedQuantity", "disclosedquantity") or top_discQ
+
+        mapped = _map_ui_to_dhan(ot_in, prc, trig)
+
+        # which broker? (digits => Dhan, else Motilal)
         brk = "dhan" if oid.isdigit() else "motilal"
 
         row = {
             "name": name,
             "order_id": oid,
-            "validity": val_in or "DAY",
+            "validity": val,
+            # build a *full* structure for Broker_dhan to forward:
+            "orderType": mapped,                 # may still be None (Broker_dhan will validate)
+            "quantity": qty,
+            "price": prc,
+            "triggerPrice": trig,
+            "disclosedQuantity": discQ if discQ is not None else "",
         }
-        if qty  is not None: row["quantity"]     = qty
-        if prc  is not None: row["price"]        = prc
-        if trig is not None: row["triggerPrice"] = trig
-
-        mapped = _map_ui_to_dhan(ot_in, prc, trig)
-        if mapped is not None:
-            row["orderType"] = mapped
 
         if brk == "dhan":
             cj = _load_dhan_client_json(name) or {}
-            row["_client_json"] = {"userid": cj.get("userid", ""), "apikey": cj.get("apikey", "")}
+            row["_client_json"] = {"userid": cj.get("userid",""), "apikey": cj.get("apikey","")}
             rows_dhan.append(row)
         else:
             rows_mo.append(row)
 
-    # -------- logging (mask secrets) --------
+    # ---- log (mask token)
     try:
+        safe = json.loads(json.dumps(rows_dhan))
+        for r in safe:
+            if r.get("_client_json", {}).get("apikey"):
+                r["_client_json"]["apikey"] = "****"
         print("\n[/modify_order] INBOUND ↓")
         print(json.dumps(payload, indent=2, default=str))
         if rows_dhan:
-            scrub = json.loads(json.dumps(rows_dhan))
-            for r in scrub:
-                if r.get("_client_json", {}).get("apikey"):
-                    r["_client_json"]["apikey"] = "****"
             print("\n[/modify_order] DHAN payload ↓")
-            print(json.dumps(scrub, indent=2))
+            print(json.dumps(safe, indent=2))
         if rows_mo:
             print("\n[/modify_order] MOTILAL payload ↓")
             print(json.dumps(rows_mo, indent=2))
@@ -1808,7 +1823,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 
     messages: list[str] = []
 
-    # ---- Dhan ----
+    # ---- Dhan
     if rows_dhan:
         try:
             dh = importlib.import_module("Broker_dhan")
@@ -1823,7 +1838,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
         except Exception as e:
             messages.append(f"❌ dhan modify failed: {e}")
 
-    # ---- Motilal (if you support it) ----
+    # ---- Motilal (optional)
     if rows_mo:
         try:
             mo = importlib.import_module("Broker_motilal")
@@ -1841,14 +1856,10 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
     return {"message": messages or ["No changes to apply."]}
 
 
-
-
-
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
