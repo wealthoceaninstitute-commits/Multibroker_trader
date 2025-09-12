@@ -694,181 +694,174 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-# --- DROP-IN: Dhan modify order route ---------------------------------------
-from collections import OrderedDict
-from typing import Any, Dict, Optional
+# brokers/dhan.py  (or wherever Broker_dhan lives)
 import json
-import os
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional
+
 import requests
-from fastapi import APIRouter, HTTPException, Request
 
-router = APIRouter()
-DHAN_BASE = "https://api.dhan.co/v2"
 
-# --- You likely already have these. Replace stubs if needed ------------------
-# MUST return {"dhanClientId": "1107279749", "access_token": "<JWT>"} for a given client name.
-def get_client_by_name(name: str) -> Dict[str, str]:
-    # TODO: Plug into your real client store
-    raise NotImplementedError("wire get_client_by_name(name) to your data")
+class Broker_dhan:
+    BASE = "https://api.dhan.co/v2"
 
-# OPTIONAL: If you already cache orders, replace this with a cache lookup
-def get_order_from_dhan(order_id: str, access_token: str) -> Dict[str, Any]:
-    url = f"{DHAN_BASE}/orders/{order_id}"
-    headers = {"Content-Type": "application/json", "access-token": access_token}
-    r = requests.get(url, headers=headers, timeout=10)
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-    return data if r.status_code == 200 else {}
+    def __init__(self, session: Optional[requests.Session] = None, logger=None):
+        self.http = session or requests.Session()
+        self.log = logger or (lambda *a, **k: print(*a, **k))
 
-# --- Helpers ----------------------------------------------------------------
-def _mask(tok: Optional[str]) -> str:
-    if not tok:
-        return ""
-    return tok[:3] + ("*" * max(0, len(tok) - 6)) + tok[-3:]
+    # ---------- helpers ----------
+    @staticmethod
+    def _mask(tok: Optional[str]) -> str:
+        if not tok:
+            return ""
+        return tok[:3] + ("*" * max(0, len(tok) - 6)) + tok[-3:]
 
-def _num_or_none(v: Any) -> Optional[float]:
-    if v is None or v == "":
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
+    def _get_order(self, order_id: str, token: str) -> Dict[str, Any]:
+        r = self.http.get(
+            f"{self.BASE}/orders/{order_id}",
+            headers={"Content-Type": "application/json", "access-token": token},
+            timeout=10,
+        )
+        try:
+            return r.json() if r.status_code == 200 else {}
+        except Exception:
+            return {}
 
-def _int_or_none(v: Any) -> Optional[int]:
-    if v is None or v == "":
-        return None
-    try:
-        return int(float(v))
-    except Exception:
-        return None
-
-def _ui_to_dhan_order_type(ui_value: Optional[str], current: Optional[str]) -> Optional[str]:
-    if ui_value:
-        u = ui_value.upper()
+    @staticmethod
+    def _map_order_type(ui_value: Optional[str], fallback: Optional[str]) -> Optional[str]:
+        if not ui_value:
+            return fallback
+        u = str(ui_value).upper()
         if u in ("NO_CHANGE", "UNCHANGED"):
-            return current
-        if u == "LIMIT":
-            return "LIMIT"
-        if u == "MARKET":
-            return "MARKET"
-        if u in ("STOPLOSS", "SL", "STOP_LOSS", "STOPLOSS_LIMIT", "SL_LIMIT"):
-            return "STOP_LOSS"  # SL-L
+            return fallback
+        if u in ("LIMIT", "MARKET"):
+            return u
+        if u in ("STOPLOSS", "STOP_LOSS", "SL", "STOPLOSS_LIMIT", "SL_LIMIT"):
+            return "STOP_LOSS"
         if u in ("SL_MARKET", "STOP_LOSS_MARKET", "STOPLOSS_MARKET"):
-            return "STOP_LOSS_MARKET"  # SL-M
-    return current
+            return "STOP_LOSS_MARKET"
+        return fallback
 
-def _validate_required(order_type: Optional[str], price: Optional[float], trig: Optional[float]) -> Optional[str]:
-    if not order_type:
-        return "orderType is required (choose NO_CHANGE to keep existing)."
-    if order_type == "LIMIT" and price is None:
-        return "price is required for LIMIT."
-    if order_type == "STOP_LOSS" and (price is None or trig is None):
-        return "Both price and triggerPrice are required for STOP_LOSS."
-    if order_type == "STOP_LOSS_MARKET" and trig is None:
-        return "triggerPrice is required for STOP_LOSS_MARKET."
-    return None
+    @staticmethod
+    def _s(v: Any) -> str:
+        # Dhan examples serialize numbers as strings; follow that.
+        if v is None or v == "":
+            return ""
+        return str(v)
 
-def _s(v: Any) -> str:
-    """Dhan doc sample uses numeric fields serialized as strings. Keep that format."""
-    if v is None:
-        return ""
-    return str(v)
+    # ---------- MAIN: implement modify_orders ----------
+    def modify_orders(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        items: list of dicts with fields such as:
+          {
+            "order_id": "...",
+            "quantity": 40,                 # optional, keep same if blank
+            "price": 33345.8,               # optional
+            "triggerPrice": 33340.0,        # optional (or 'triggerprice')
+            "orderType": "NO_CHANGE|LIMIT|MARKET|STOPLOSS|SL_MARKET",  # optional
+            "validity": "DAY|IOC",          # optional (default DAY)
+            "_client_json": {"userid": "<dhanClientId>", "apikey": "<JWT>"}
+          }
+        Returns: list of {"order_id", "status_code", "response"}
+        """
+        out = []
 
-# --- Route -------------------------------------------------------------------
-@router.post("/modify_order")
-async def modify_order(request: Request):
-    body = await request.json()
-    order = body.get("order") or {}
+        for it in items:
+            order_id = str(it.get("order_id") or it.get("orderId") or "").strip()
+            cj = it.get("_client_json") or {}
+            dhan_client_id = str(cj.get("userid") or cj.get("dhanClientId") or "").strip()
+            token = cj.get("apikey") or cj.get("access_token") or ""
 
-    name = order.get("name") or ""
-    order_id = str(order.get("order_id") or "").strip()
-    if not name or not order_id:
-        raise HTTPException(status_code=400, detail="name and order_id are required")
+            if not order_id or not dhan_client_id or not token:
+                out.append(
+                    {
+                        "order_id": order_id,
+                        "status_code": 400,
+                        "response": {
+                            "errorType": "ClientError",
+                            "errorMessage": "Missing order_id or client credentials (dhanClientId/access-token).",
+                        },
+                    }
+                )
+                continue
 
-    # Client (dhanClientId + access token)
-    client = get_client_by_name(name)
-    dclid = str(client["dhanClientId"])
-    token = client["access_token"]
+            # Current order (for NO_CHANGE fallbacks)
+            current = self._get_order(order_id, token)
+            current_type = (current.get("orderType") or current.get("order_type") or "").upper() or None
+            current_qty = current.get("quantity") or current.get("qty") or None
+            current_validity = (current.get("validity") or "DAY").upper()
 
-    # UI inputs (may be blank to keep same)
-    qty_in = _int_or_none(order.get("quantity"))
-    price_in = _num_or_none(order.get("price"))
-    trig_in = _num_or_none(order.get("triggerprice") or order.get("triggerPrice"))
-    ui_order_type = order.get("orderType") or order.get("order_type")  # from radio buttons if present
-    validity_in = (order.get("validity") or "").upper().strip()  # "DAY" or "IOC" or blank
+            # Inputs
+            ui_type = it.get("orderType") or it.get("orderType_in") or it.get("mapped_orderType")
+            order_type = self._map_order_type(ui_type, current_type) or "LIMIT"
 
-    # Fetch current order to fill blanks (type, qty, validity)
-    current = get_order_from_dhan(order_id, token) or {}
-    current_type = (current.get("orderType") or current.get("order_type") or "").upper() or None
-    current_qty = _int_or_none(current.get("quantity"))
-    current_validity = (current.get("validity") or "DAY").upper()
+            qty_in = it.get("quantity")
+            quantity = int(qty_in) if qty_in not in (None, "") else (int(current_qty) if current_qty else 0)
 
-    # Resolve effective values
-    order_type = _ui_to_dhan_order_type(ui_order_type, current_type) or "LIMIT"
-    quantity = qty_in if qty_in is not None else (current_qty or 0)
-    validity = validity_in if validity_in in ("DAY", "IOC") else current_validity
+            price_in = it.get("price")
+            price = None if price_in in (None, "") else float(price_in)
 
-    price = price_in
-    trig = trig_in
+            trig_in = it.get("triggerPrice", it.get("triggerprice"))
+            trigger = None if trig_in in (None, "") else float(trig_in)
 
-    # Validate conditional requirements before calling Dhan
-    err = _validate_required(order_type, price, trig)
-    if err:
-        raise HTTPException(status_code=400, detail=err)
+            validity = (it.get("validity") or current_validity or "DAY").upper()
+            if validity not in ("DAY", "IOC"):
+                validity = "DAY"
 
-    # Build payload EXACTLY as shown in docs (key order preserved)
-    payload = OrderedDict([
-        ("dhanClientId", _s(dclid)),
-        ("orderId", _s(order_id)),
-        ("orderType", order_type or ""),
-        ("legName", ""),                 # not used for normal orders
-        ("quantity", _s(quantity)),      # int as string
-        ("price", _s(price)),            # float as string ("" if not applicable)
-        ("disclosedQuantity", _s("")),   # keep hidden qty unchanged
-        ("triggerPrice", _s(trig)),      # float as string ("" if not applicable)
-        ("validity", validity or "DAY"),
-    ])
+            # Conditional rules per Dhan
+            if order_type == "MARKET":
+                price, trigger = None, None
+            elif order_type == "STOP_LOSS_MARKET":
+                # SL-M: trigger required, price must be blank
+                price = None
 
-    # MARKET: explicitly blank price/trigger
-    if order_type == "MARKET":
-        payload["price"] = ""
-        payload["triggerPrice"] = ""
-    # STOP_LOSS_MARKET: no limit price
-    if order_type == "STOP_LOSS_MARKET":
-        payload["price"] = ""
+            # Build payload EXACTLY like docs (key order + stringified numerics)
+            payload = OrderedDict(
+                [
+                    ("dhanClientId", self._s(dhan_client_id)),
+                    ("orderId", self._s(order_id)),
+                    ("orderType", order_type or ""),
+                    ("legName", ""),
+                    ("quantity", self._s(quantity)),
+                    ("price", self._s(price)),
+                    ("disclosedQuantity", self._s("")),
+                    ("triggerPrice", self._s(trigger)),
+                    ("validity", validity),
+                ]
+            )
 
-    # ---- Verbose, safe logs (Deploy Logs in Railway) -----------------------
-    print("\n[/modify_order] INBOUND ↓")
-    print(json.dumps(body, indent=2))
-    print("\n[/modify_order] Dhan ModifyOrder (OUT) ↓")
-    print(json.dumps({
-        "url": f"{DHAN_BASE}/orders/{order_id}",
-        "headers": {"Content-Type": "application/json", "access-token": _mask(token)},
-        "payload": payload
-    }, indent=2))
+            # Emit safe logs
+            self.log("\n---- Dhan ModifyOrder (OUT) ----")
+            self.log(
+                json.dumps(
+                    {
+                        "url": f"{self.BASE}/orders/{order_id}",
+                        "headers": {"Content-Type": "application/json", "access-token": self._mask(token)},
+                        "payload": payload,
+                    },
+                    indent=2,
+                )
+            )
 
-    # Call Dhan
-    url = f"{DHAN_BASE}/orders/{order_id}"
-    headers = {"Content-Type": "application/json", "access-token": token}
-    resp = requests.put(url, headers=headers, json=payload, timeout=10)
+            # Call Dhan
+            r = self.http.put(
+                f"{self.BASE}/orders/{order_id}",
+                headers={"Content-Type": "application/json", "access-token": token},
+                json=payload,
+                timeout=10,
+            )
+            try:
+                resp_json = r.json()
+            except Exception:
+                resp_json = {"raw": r.text}
 
-    try:
-        resp_json = resp.json()
-    except Exception:
-        resp_json = {"raw": resp.text}
+            self.log("\n---- Dhan ModifyOrder (RESP) ----")
+            self.log(json.dumps({"status_code": r.status_code, "response": resp_json}, indent=2))
 
-    print("\n[/modify_order] Dhan ModifyOrder (RESP) ↓")
-    print(json.dumps({"status_code": resp.status_code, "response": resp_json}, indent=2))
+            out.append({"order_id": order_id, "status_code": r.status_code, "response": resp_json})
 
-    # Bubble up Dhan errors to the UI, but keep 200 on your app if you prefer
-    if resp.status_code >= 400:
-        # Dhan typical error: {"errorType":"Input_Exception","errorCode":"DH-905","errorMessage":"..."}
-        raise HTTPException(status_code=400, detail=resp_json)
+        return out
 
-    return {"ok": True, "dhan_status": resp.status_code, "dhan_response": resp_json}
-# ---------------------------------------------------------------------------#
 
 
 
