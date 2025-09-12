@@ -484,17 +484,13 @@ def _has_required_for_login(broker: str, c: Dict[str, Any]) -> bool:
     ))
 
 def _dispatch_login(broker: str, path: str):
-    """
-    Import Broker_* module and call login(client).
-    If module is absent or fields insufficient, skip cleanly.
-    """
     try:
         client = _load(path)
+
         if not _has_required_for_login(broker, client):
             print(f"[router] skip login ({broker}/{client.get('userid')}): missing fields")
             return
 
-        # dynamic import by filename:
         mod_name = "Broker_dhan" if broker == "dhan" else "Broker_motilal"
         mod = importlib.import_module(mod_name)
         login_fn = getattr(mod, "login", None)
@@ -502,13 +498,36 @@ def _dispatch_login(broker: str, path: str):
             print(f"[router] {mod_name}.login() not found")
             return
 
-        ok = bool(login_fn(client))
+        result = login_fn(client)
+
+        # NEW: handle dict returned by upgraded Dhan login
+        ok = bool(result if not isinstance(result, dict) else result.get("ok", True))
+
+        if isinstance(result, dict):
+            # persist token info so UI/endpoints can show it
+            if result.get("token_validity_raw") or result.get("token_validity_iso"):
+                client["token_validity"] = result.get("token_validity_raw") or result.get("token_validity_iso")
+                client["token_validity_iso"] = result.get("token_validity_iso", "")
+            if result.get("token_days_left") is not None:
+                client["token_days_left"] = int(result["token_days_left"])
+            if result.get("token_warning") is not None:
+                client["token_warning"] = bool(result["token_warning"])
+            # optional: last checked timestamp
+            from datetime import datetime
+            client["last_token_check"] = datetime.utcnow().isoformat() + "Z"
+
+            # Log the warning text once at login time
+            if result.get("message"):
+                print(f"[router] {result['message']}")
+
         client["session_active"] = ok
         _save(path, client)
+
     except ModuleNotFoundError:
         print(f"[router] module for {broker} not found (Broker_dhan.py / Broker_motilal.py); saved only")
     except Exception as e:
         print(f"[router] login error ({broker}): {e}")
+
 
 def _delete_client_file(broker: str, userid: str) -> bool:
     """Remove a single client's JSON file. Returns True if deleted, False if it didn't exist."""
@@ -1966,6 +1985,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
