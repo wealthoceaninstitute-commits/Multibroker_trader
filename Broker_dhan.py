@@ -694,154 +694,175 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-# Broker_dhan.py
-from __future__ import annotations
+# brokers/dhan.py  (or wherever Broker_dhan lives)
 import json
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import requests
 
-DHAN_BASE = "https://api.dhan.co/v2"
 
+class Broker_dhan:
+    BASE = "https://api.dhan.co/v2"
 
-# ---------- small helpers ----------
-def _s(v: Any) -> str:
-    """Dhan examples send numeric fields as strings; keep that behavior."""
-    if v is None or str(v).strip() == "":
-        return ""
-    return str(v)
+    def __init__(self, session: Optional[requests.Session] = None, logger=None):
+        self.http = session or requests.Session()
+        self.log = logger or (lambda *a, **k: print(*a, **k))
 
-def _mask(tok: Optional[str]) -> str:
-    if not tok:
-        return ""
-    return tok[:3] + ("*" * max(0, len(tok) - 6)) + tok[-3:]
+    # ---------- helpers ----------
+    @staticmethod
+    def _mask(tok: Optional[str]) -> str:
+        if not tok:
+            return ""
+        return tok[:3] + ("*" * max(0, len(tok) - 6)) + tok[-3:]
 
-def _infer_type(price: Any, trig: Any) -> str:
-    """Last-resort inference if caller forgot orderType."""
-    has_p = (price is not None) and (str(price).strip() != "")
-    has_t = (trig  is not None) and (str(trig).strip()  != "")
-    if has_t and has_p:
-        return "STOP_LOSS"            # SL-L
-    if has_t and not has_p:
-        return "STOP_LOSS_MARKET"     # SL-M
-    if has_p and not has_t:
-        return "LIMIT"
-    return "MARKET"
-
-def _norm_type(val: Optional[str], price: Any, trig: Any) -> str:
-    if not val:
-        return _infer_type(price, trig)
-    u = str(val).upper()
-    if u in ("LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_MARKET"):
-        return u
-    if u in ("STOPLOSS", "SL", "SL_LIMIT"):
-        return "STOP_LOSS"
-    if u in ("SL-MARKET", "SL_MARKET", "STOPLOSS_MARKET"):
-        return "STOP_LOSS_MARKET"
-    # NO_CHANGE or anything unknown -> infer
-    return _infer_type(price, trig)
-
-
-# ---------- PUBLIC: called by MultiBroker_Router.route_modify_order ----------
-def modify_orders(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    items (per router):
-      {
-        "name": "...",
-        "order_id": "95250....",
-        "validity": "DAY|IOC",
-        "quantity": 40 | None,
-        "price": 12900 | None,
-        "triggerPrice": 12904.95 | None,
-        "orderType": "LIMIT|MARKET|STOP_LOSS|STOP_LOSS_MARKET",
-        "_client_json": { "userid": "<dhanClientId>", "apikey": "<JWT>" }
-      }
-    Returns: {"message":[...], "results":[...]} for the router to show in the UI.
-    """
-    session = requests.Session()
-    msgs: List[str] = []
-    results: List[Dict[str, Any]] = []
-
-    for it in (items or []):
-        name       = (it.get("name") or "").strip()
-        order_id   = str(it.get("order_id") or it.get("orderId") or "").strip()
-        validity   = (it.get("validity") or "DAY").upper()
-        qty        = it.get("quantity")
-        price      = it.get("price")
-        trig       = it.get("triggerPrice") if "triggerPrice" in it else it.get("triggerprice")
-        order_type = _norm_type(it.get("orderType"), price, trig)
-
-        cj         = it.get("_client_json") or {}
-        dhan_id    = str(cj.get("userid") or cj.get("dhanClientId") or "").strip()
-        token      = (cj.get("apikey") or cj.get("access_token") or "").strip()
-
-        # Basic guardrails
-        if not order_id or not dhan_id or not token:
-            msg = f"❌ Dhan modify skipped for {name or 'client'}: missing orderId/client/token"
-            msgs.append(msg)
-            results.append({"order_id": order_id, "ok": False, "reason": "missing_creds"})
-            continue
-
-        # Field rules (Dhan requires certain combos)
-        if order_type == "MARKET":
-            price, trig = None, None
-        elif order_type == "STOP_LOSS_MARKET":
-            price = None     # SL-M must not send price
-
-        # Build payload EXACTLY as docs (all keys, same order; numeric as strings)
-        payload = OrderedDict([
-            ("dhanClientId",       _s(dhan_id)),
-            ("orderId",            _s(order_id)),
-            ("orderType",          order_type),
-            ("legName",            ""),
-            ("quantity",           _s(qty)),
-            ("price",              _s(price)),
-            ("disclosedQuantity",  _s("")),        # UI not using this; keep blank
-            ("triggerPrice",       _s(trig)),
-            ("validity",           validity),
-        ])
-
-        url = f"{DHAN_BASE}/orders/{order_id}"
-        headers = {"Content-Type": "application/json", "access-token": token}
-
-        # Safe logs for Railway
+    def _get_order(self, order_id: str, token: str) -> Dict[str, Any]:
+        r = self.http.get(
+            f"{self.BASE}/orders/{order_id}",
+            headers={"Content-Type": "application/json", "access-token": token},
+            timeout=10,
+        )
         try:
-            print("\n---- Dhan ModifyOrder (OUT) ----")
-            print(json.dumps({
-                "url": url,
-                "headers": {"Content-Type": "application/json", "access-token": _mask(token)},
-                "payload": payload
-            }, indent=2))
+            return r.json() if r.status_code == 200 else {}
         except Exception:
-            pass
+            return {}
 
-        try:
-            resp = session.put(url, headers=headers, json=payload, timeout=15)
+    @staticmethod
+    def _map_order_type(ui_value: Optional[str], fallback: Optional[str]) -> Optional[str]:
+        if not ui_value:
+            return fallback
+        u = str(ui_value).upper()
+        if u in ("NO_CHANGE", "UNCHANGED"):
+            return fallback
+        if u in ("LIMIT", "MARKET"):
+            return u
+        if u in ("STOPLOSS", "STOP_LOSS", "SL", "STOPLOSS_LIMIT", "SL_LIMIT"):
+            return "STOP_LOSS"
+        if u in ("SL_MARKET", "STOP_LOSS_MARKET", "STOPLOSS_MARKET"):
+            return "STOP_LOSS_MARKET"
+        return fallback
+
+    @staticmethod
+    def _s(v: Any) -> str:
+        # Dhan examples serialize numbers as strings; follow that.
+        if v is None or v == "":
+            return ""
+        return str(v)
+
+    # ---------- MAIN: implement modify_orders ----------
+    def modify_orders(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        items: list of dicts with fields such as:
+          {
+            "order_id": "...",
+            "quantity": 40,                 # optional, keep same if blank
+            "price": 33345.8,               # optional
+            "triggerPrice": 33340.0,        # optional (or 'triggerprice')
+            "orderType": "NO_CHANGE|LIMIT|MARKET|STOPLOSS|SL_MARKET",  # optional
+            "validity": "DAY|IOC",          # optional (default DAY)
+            "_client_json": {"userid": "<dhanClientId>", "apikey": "<JWT>"}
+          }
+        Returns: list of {"order_id", "status_code", "response"}
+        """
+        out = []
+
+        for it in items:
+            order_id = str(it.get("order_id") or it.get("orderId") or "").strip()
+            cj = it.get("_client_json") or {}
+            dhan_client_id = str(cj.get("userid") or cj.get("dhanClientId") or "").strip()
+            token = cj.get("apikey") or cj.get("access_token") or ""
+
+            if not order_id or not dhan_client_id or not token:
+                out.append(
+                    {
+                        "order_id": order_id,
+                        "status_code": 400,
+                        "response": {
+                            "errorType": "ClientError",
+                            "errorMessage": "Missing order_id or client credentials (dhanClientId/access-token).",
+                        },
+                    }
+                )
+                continue
+
+            # Current order (for NO_CHANGE fallbacks)
+            current = self._get_order(order_id, token)
+            current_type = (current.get("orderType") or current.get("order_type") or "").upper() or None
+            current_qty = current.get("quantity") or current.get("qty") or None
+            current_validity = (current.get("validity") or "DAY").upper()
+
+            # Inputs
+            ui_type = it.get("orderType") or it.get("orderType_in") or it.get("mapped_orderType")
+            order_type = self._map_order_type(ui_type, current_type) or "LIMIT"
+
+            qty_in = it.get("quantity")
+            quantity = int(qty_in) if qty_in not in (None, "") else (int(current_qty) if current_qty else 0)
+
+            price_in = it.get("price")
+            price = None if price_in in (None, "") else float(price_in)
+
+            trig_in = it.get("triggerPrice", it.get("triggerprice"))
+            trigger = None if trig_in in (None, "") else float(trig_in)
+
+            validity = (it.get("validity") or current_validity or "DAY").upper()
+            if validity not in ("DAY", "IOC"):
+                validity = "DAY"
+
+            # Conditional rules per Dhan
+            if order_type == "MARKET":
+                price, trigger = None, None
+            elif order_type == "STOP_LOSS_MARKET":
+                # SL-M: trigger required, price must be blank
+                price = None
+
+            # Build payload EXACTLY like docs (key order + stringified numerics)
+            payload = OrderedDict(
+                [
+                    ("dhanClientId", self._s(dhan_client_id)),
+                    ("orderId", self._s(order_id)),
+                    ("orderType", order_type or ""),
+                    ("legName", ""),
+                    ("quantity", self._s(quantity)),
+                    ("price", self._s(price)),
+                    ("disclosedQuantity", self._s("")),
+                    ("triggerPrice", self._s(trigger)),
+                    ("validity", validity),
+                ]
+            )
+
+            # Emit safe logs
+            self.log("\n---- Dhan ModifyOrder (OUT) ----")
+            self.log(
+                json.dumps(
+                    {
+                        "url": f"{self.BASE}/orders/{order_id}",
+                        "headers": {"Content-Type": "application/json", "access-token": self._mask(token)},
+                        "payload": payload,
+                    },
+                    indent=2,
+                )
+            )
+
+            # Call Dhan
+            r = self.http.put(
+                f"{self.BASE}/orders/{order_id}",
+                headers={"Content-Type": "application/json", "access-token": token},
+                json=payload,
+                timeout=10,
+            )
             try:
-                body = resp.json()
+                resp_json = r.json()
             except Exception:
-                body = {"raw": resp.text}
+                resp_json = {"raw": r.text}
 
-            try:
-                print("\n---- Dhan ModifyOrder (RESP) ----")
-                print(json.dumps({"status_code": resp.status_code, "response": body}, indent=2))
-            except Exception:
-                pass
+            self.log("\n---- Dhan ModifyOrder (RESP) ----")
+            self.log(json.dumps({"status_code": r.status_code, "response": resp_json}, indent=2))
 
-            ok = 200 <= resp.status_code < 300
-            if ok:
-                msgs.append(f"✅ Modified Order {order_id} for {name or dhan_id}")
-            else:
-                err = (body.get("errorMessage") if isinstance(body, dict) else None) or body
-                msgs.append(f"❌ Dhan modify failed for {name or dhan_id} ({order_id}): {err}")
-            results.append({"order_id": order_id, "status_code": resp.status_code, "response": body, "ok": ok})
+            out.append({"order_id": order_id, "status_code": r.status_code, "response": resp_json})
 
-        except requests.RequestException as e:
-            msgs.append(f"❌ Dhan modify network error for {name or dhan_id} ({order_id}): {e}")
-            results.append({"order_id": order_id, "ok": False, "error": str(e)})
+        return out
 
-    return {"message": msgs, "results": results}
+
 
 
 
