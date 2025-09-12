@@ -694,56 +694,44 @@ def modify_order_dhan(
         return {"status": "error", "message": f"Dhan modify call failed: {e}"}
 
 
-# Broker_dhan.py
 import json, requests
 
 DHAN_BASE = "https://api.dhan.co"
 
 def modify_orders(rows: list[dict]) -> dict:
-    """
-    rows: [{
-      name, order_id, validity,
-      orderType?, price?, triggerPrice?, quantity?,
-      _client_json: {userid, apikey}
-    }]
-    Returns: { "message": [ ... ] }
-    """
     msgs: list[str] = []
 
     for row in rows:
         cj        = row.get("_client_json") or {}
-        token     = (cj.get("apikey") or "").strip()
-        client_id = (cj.get("userid") or "").strip()
+        token     = (cj.get("apikey")  or "").strip()
+        client_id = (cj.get("userid")  or "").strip()
         oid       = str(row.get("order_id") or "").strip()
 
         if not token or not client_id or not oid:
             msgs.append(f"❌ Dhan modify skipped for {row.get('name','')}: missing token/clientId/order_id")
             continue
 
-        ot    = row.get("orderType")  # already mapped to Dhan enums by router if present
-        price = row.get("price", None)
-        trig  = row.get("triggerPrice", None)
-        qty   = row.get("quantity", None)
+        ot    = row.get("orderType")
+        price = row.get("price")
+        trig  = row.get("triggerPrice")
+        qty   = row.get("quantity")
+        discQ = row.get("disclosedQuantity") if row.get("disclosedQuantity") is not None else ""
 
-        # type sanitize
+        # infer type when user left 'NO_CHANGE'
         def _num_or_none(v, cast=float):
             try: return cast(v)
             except Exception: return None
 
-        if price is not None: price = _num_or_none(price, float)
-        if trig  is not None: trig  = _num_or_none(trig,  float)
-        if qty   is not None: qty   = _num_or_none(qty,   int)
+        price = _num_or_none(price, float) if price not in ("", None) else None
+        trig  = _num_or_none(trig,  float) if trig  not in ("", None) else None
+        qty   = _num_or_none(qty,     int) if qty   not in ("", None) else None
 
-        # derive orderType when user chose NO_CHANGE but changed numbers
         if not ot:
-            if trig is not None and price is not None:
-                ot = "STOP_LOSS"
-            elif trig is not None and price is None:
-                ot = "STOP_LOSS_MARKET"
-            elif price is not None:
-                ot = "LIMIT"
+            if trig is not None and price is not None: ot = "STOP_LOSS"
+            elif trig is not None:                    ot = "STOP_LOSS_MARKET"
+            elif price is not None:                   ot = "LIMIT"
 
-        # validate combos to avoid DH-905
+        # final validation (avoid DH-905)
         if ot == "LIMIT":
             if price is None:
                 msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): LIMIT requires price.")
@@ -751,30 +739,31 @@ def modify_orders(rows: list[dict]) -> dict:
             trig = None
         elif ot == "STOP_LOSS":
             if price is None or trig is None:
-                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS requires price & triggerPrice.")
+                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS needs price & triggerPrice.")
                 continue
         elif ot == "STOP_LOSS_MARKET":
             if trig is None:
-                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS_MARKET requires triggerPrice.")
+                msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): STOP_LOSS_MARKET needs triggerPrice.")
                 continue
             price = None
         elif ot == "MARKET":
-            price = None
-            trig  = None
+            price = None; trig = None
         else:
             msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): orderType missing/invalid.")
             continue
 
+        # ---- FULL DHAN REQUEST STRUCTURE
         payload = {
             "dhanClientId": client_id,
             "orderId": oid,
-            "orderType": ot,
+            "orderType": ot,                     # LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
             "legName": "",
-            "validity": (row.get("validity") or "DAY").upper()
+            "quantity": qty if qty is not None else "",              # send key even if blank
+            "price": price if price is not None else "",
+            "disclosedQuantity": discQ if str(discQ) != "None" else "",
+            "triggerPrice": trig if trig is not None else "",
+            "validity": (row.get("validity") or "DAY").upper(),
         }
-        if qty   is not None: payload["quantity"]     = qty
-        if price is not None: payload["price"]        = price
-        if trig  is not None: payload["triggerPrice"] = trig
 
         url = f"{DHAN_BASE}/v2/orders/{oid}"
         headers = {"Content-Type": "application/json", "access-token": token}
@@ -803,13 +792,14 @@ def modify_orders(rows: list[dict]) -> dict:
             if resp.status_code in (200, 201) and isinstance(body, dict) and str(body.get("status","")).lower() == "success":
                 msgs.append(f"✅ Dhan modified order {oid} for {row.get('name','')}")
             else:
-                # surface Dhan’s message when available
                 err = body.get("errorMessage") if isinstance(body, dict) else body
                 msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): {err}")
         except Exception as e:
             msgs.append(f"❌ Dhan modify failed for {row.get('name','')} ({oid}): {e}")
 
     return {"message": msgs}
+
+
 
 
 
