@@ -23,6 +23,7 @@ const config = {
       { source: '/enable_copy_setup',       destination: to('/enable_copy_setup') },
       { source: '/disable_copy_setup',      destination: to('/disable_copy_setup') },
       { source: '/delete_copy_setup',       destination: to('/delete_copy_setup') },
+      { source: '/search_symbols', destination: to('/search_symbols') },
     ];
   },
 };
