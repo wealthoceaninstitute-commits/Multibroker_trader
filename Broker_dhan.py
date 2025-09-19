@@ -694,7 +694,8 @@ def _build_dhan_modify_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     Build a clean Dhan modify payload:
     - ints/floats stay numeric (no quotes)
     - disclosedQuantity is always 0 (never "")
-    - omit fields that are blank/zero so Dhan treats them as unchanged
+    - OMIT orderType when user didn't request a change and no price/trigger was given
+      (so Dhan preserves existing type on broker).
     """
     def _has_value(x) -> bool:
         if x is None:
@@ -718,11 +719,11 @@ def _build_dhan_modify_payload(row: Dict[str, Any]) -> Dict[str, Any]:
             return "LIMIT"
         return "MARKET"
 
-    cj   = (row.get("_client_json") or {})
+    cj    = (row.get("_client_json") or {})
     price = row.get("price")
     trig  = row.get("triggerPrice") if "triggerPrice" in row else row.get("triggerprice")
 
-    # Normalize orderType (fallback: infer from provided values)
+    # Normalize incoming UI word; may be blank if user didn't change type
     ot_in  = (row.get("orderType") or "").strip().upper().replace("-", "_")
     ot_map = {
         "LIMIT": "LIMIT",
@@ -737,15 +738,24 @@ def _build_dhan_modify_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         "NO_CHANGE": "",
         "": "",
     }
-    order_type = ot_map.get(ot_in, ot_in) or _infer_type_local(price, trig)
+    order_type = ot_map.get(ot_in, ot_in)  # may be ""
+
+    # Only decide a type if user provided one OR gave price/trigger to imply a change
+    if not order_type:
+        if _has_value(price) or _has_value(trig):
+            order_type = _infer_type_local(price, trig)
+        else:
+            order_type = None  # keep existing type on broker
 
     payload: Dict[str, Any] = {
         "dhanClientId": str(cj.get("userid") or cj.get("client_id") or ""),
         "orderId": str(row.get("order_id") or row.get("orderId") or ""),
-        "orderType": order_type,
         "validity": str(row.get("validity") or "DAY").upper(),
         "disclosedQuantity": 0,  # numeric 0, never ""
     }
+
+    if order_type:
+        payload["orderType"] = order_type
 
     q = row.get("quantity")
     if _has_value(q):
@@ -766,7 +776,6 @@ def _build_dhan_modify_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Only include legName if non-empty
     leg = row.get("legName")
     if isinstance(leg, str) and leg.strip():
         payload["legName"] = leg.strip()
@@ -857,19 +866,6 @@ def modify_orders(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
             messages.append(f"❌ {row.get('name','<unknown>')} ({row.get('order_id','?')}): {e}")
 
     return {"message": messages}
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
