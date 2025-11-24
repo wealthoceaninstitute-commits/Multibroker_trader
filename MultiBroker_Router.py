@@ -15,7 +15,7 @@ STAT_KEYS = ["pending", "traded", "rejected", "cancelled", "others"]
 summary_data_global: Dict[str, Dict[str, Any]] = {}
 SYMBOL_DB_PATH = os.path.join(os.path.abspath(os.environ.get("DATA_DIR", "./data")), "symbols.db")
 SYMBOL_TABLE   = "symbols"
-SYMBOL_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv"
+SYMBOL_CSV_URL = "https://raw.githubusercontent.com/Pramod541988/Stock_List/refs/heads/main/security_id.csv"
 _symbol_db_lock = threading.Lock()
 
 
@@ -2001,6 +2001,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
