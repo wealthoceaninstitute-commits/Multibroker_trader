@@ -815,6 +815,20 @@ def delete_client(payload: Dict[str, Any] = Body(...)):
     return {"success": True, "deleted": deleted, "missing": missing}
 
 
+@app.get("/debug/list_local_clients")
+def debug_local_clients():
+    result = {"motilal": [], "dhan": []}
+    for brk, folder in (("dhan", DHAN_DIR), ("motilal", MO_DIR)):
+        try:
+            for fn in os.listdir(folder):
+                if fn.endswith(".json"):
+                    result[brk].append(fn)
+        except Exception as e:
+            result[brk].append(f"Error: {e}")
+    return result
+
+
+
 @app.post("/add_group")
 def add_group(payload: Dict[str, Any] = Body(...)):
     """
@@ -2001,6 +2015,7 @@ def route_modify_order(payload: Dict[str, Any] = Body(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MultiBroker_Router:app", host="127.0.0.1", port=5001, reload=False)
+
 
 
 
