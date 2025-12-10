@@ -1,0 +1,25 @@
+providers:
+  python: true
+  nodejs: true
+
+python:
+  version: "3.12"
+  installPackages: true
+
+pip:
+  # These MUST match your requirements.txt
+  packages:
+    - fastapi
+    - uvicorn[standard]
+    - requests
+    - python-dotenv
+    - pydantic
+    - playwright
+
+# Ensure playwright browser installs during build
+build:
+  cmds:
+    - playwright install chromium
+
+start:
+  cmd: uvicorn MultiBroker_Router:app --host 0.0.0.0 --port $PORT
